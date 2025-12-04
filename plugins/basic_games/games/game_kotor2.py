@@ -735,7 +735,7 @@ class Kotor2ModDataChecker(BasicModDataChecker):
 
                 return filetree
 
-        # SIMPLE CASE: exactly ONE directory at the root → flatten into override
+        # SIMPLE CASE: exactly ONE directory at the root = flatten into override
         root_dirs = [e for e in list(filetree) if is_directory(e)]
 
         if len(root_dirs) == 1:
@@ -757,7 +757,7 @@ class Kotor2ModDataChecker(BasicModDataChecker):
 
 
 
-        # Loose files in root that are NOT in ignored list → override
+        # Loose files in root that are NOT in ignored list => override
         ignored = self._ignored_exts
 
         root_files = [e for e in list(filetree) if not is_directory(e)]
