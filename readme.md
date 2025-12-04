@@ -19,7 +19,7 @@ Enables full modding support for both games in Mod Organizer 2.
 ## Usage
 Mod Organizer 2 **3.x dev build** is required. This pre-release build is available on their [Discord](https://discord.gg/ewUVAqyrQX).
 
-Download the KOTOR plugin from the Releases page and extract it into your MO2 directory.
+Download the KOTOR plugin from the [Releases](https://github.com/J0-o/KOTOR-Mod-Organizer-2-Plugin/releases) page and extract it into your MO2 directory.
 
 When downloading mods, place them in the **Downloads** folder under your MO2 directory or drag them directly into the **Downloads** tab.
 
