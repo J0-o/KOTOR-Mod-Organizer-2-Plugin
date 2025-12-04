@@ -59,6 +59,13 @@ if (Test-Path -LiteralPath $modlistPath) {
             $modOrder += $Matches[1].Trim()
         }
     }
+    # If HK_REASSEMBLER mod is enabled, abort and inform the user.
+    if ($modlistLines | Where-Object { $_ -match '^\+HK_REASSEMBLER\b' }) {
+        Write-Host "`nHK_REASSEMBLER mod is enabled. Please disable it before running HK Reassembler." -ForegroundColor Yellow
+        Write-Host "Press any key to exit..."
+        [void][System.Console]::ReadKey($true)
+        exit
+    }
 } else {
     Write-Host "modlist.txt not found for profile: $selectedProfile"
     $modOrder = @()
