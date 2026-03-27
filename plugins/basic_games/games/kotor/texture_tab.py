@@ -73,10 +73,13 @@ class Kotor2TextureTab(QWidget):
         self._count_label = QLabel("0 texture files")
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self.refresh)
+        auto_fix_btn = QPushButton("Auto Fix")
+        auto_fix_btn.clicked.connect(self._auto_fix)
         unhide_btn = QPushButton("Unhide all")
         unhide_btn.clicked.connect(self._unhide_all)
         header.addWidget(self._count_label)
         header.addStretch()
+        header.addWidget(auto_fix_btn)
         header.addWidget(unhide_btn)
         header.addWidget(refresh_btn)
         layout.addLayout(header)
@@ -360,6 +363,35 @@ class Kotor2TextureTab(QWidget):
         finally:
             self.refresh()
 
+    # Hide lower-priority visible texture variants for each texture base.
+    def _auto_fix(self):
+        visible_by_base: dict[str, dict[str, Path]] = {}
+        for i in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(i)
+            if bool(item.data(0, Qt.ItemDataRole.UserRole + 1)):
+                continue
+            path = self._item_path(item)
+            base = item.data(0, Qt.ItemDataRole.UserRole + 4)
+            if not path or not base:
+                continue
+            visible_by_base.setdefault(str(base), {})[path.suffix.lower()] = path
+
+        to_hide: list[Path] = []
+        for files in visible_by_base.values():
+            winner_exts = self._winner_extensions(files)
+            if not winner_exts:
+                continue
+            for ext, path in files.items():
+                if ext not in winner_exts:
+                    to_hide.append(path)
+
+        for path in to_hide:
+            try:
+                path.rename(path.with_name(path.name + ".mohidden"))
+            except Exception as e:
+                logger.warning(f"[KOTOR2] Failed to auto-hide {path}: {e}")
+        self.refresh()
+
     # Unhide every hidden texture in the active mod stack.
     def _unhide_all(self):
         paths: list[Path] = []
@@ -374,6 +406,23 @@ class Kotor2TextureTab(QWidget):
             except Exception as e:
                 logger.warning(f"[KOTOR2] Failed to unhide {path}: {e}")
         self.refresh()
+
+    # Return the visible extension set to keep for one texture base.
+    @staticmethod
+    def _winner_extensions(files: dict[str, Path]) -> set[str]:
+        if ".tpc" in files:
+            return {".tpc"}
+        if ".tga" in files and ".txi" not in files:
+            return {".tga"}
+        if ".tga" in files and ".txi" in files:
+            return {".tga", ".txi"}
+        if ".dds" in files and ".txi" not in files:
+            return {".dds"}
+        if ".dds" in files and ".txi" in files:
+            return {".dds", ".txi"}
+        if ".txi" in files:
+            return {".txi"}
+        return set()
 
     # Format a byte count for display.
     @staticmethod

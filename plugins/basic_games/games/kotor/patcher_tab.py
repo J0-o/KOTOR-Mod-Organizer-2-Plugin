@@ -44,6 +44,7 @@ from ui_theme import (
 )
 
 logger = logging.getLogger("mobase")
+PATCHER_MOD_NAME = "[ PATCHER FILES ]"
 
 
 # Convert a subset of RTF into readable plain text.
@@ -566,7 +567,7 @@ class Kotor2HKReassemblerTab(QWidget):
         mod_list = self._organizer.modList()
         mods_root = Path(self._organizer.modsPath())
         for mod_name in self._profile_mod_order():
-            if mod_name == "HK_REASSEMBLER":
+            if mod_name == PATCHER_MOD_NAME:
                 continue
             if not (mod_list.state(mod_name) & mobase.ModState.ACTIVE):
                 continue
@@ -775,7 +776,7 @@ class Kotor2HKReassemblerTab(QWidget):
         mods_root = Path(self._organizer.modsPath())
         active_mods: list[Path] = []
         for mod_name in reversed(self._profile_mod_order()):
-            if mod_name == "HK_REASSEMBLER":
+            if mod_name == PATCHER_MOD_NAME:
                 continue
             if not (self._organizer.modList().state(mod_name) & mobase.ModState.ACTIVE):
                 continue
@@ -903,12 +904,12 @@ class Kotor2HKReassemblerTab(QWidget):
             self._set_status_text("No enabled HK patches to prepare.")
             return
 
-        hk_dir = Path(self._organizer.modsPath()) / "HK_REASSEMBLER"
+        hk_dir = Path(self._organizer.modsPath()) / PATCHER_MOD_NAME
         self._stop_hk_requested = False
         if manage_busy:
             self._set_runner_busy(True)
         try:
-            self._set_status_text("Preparing HK_REASSEMBLER...\nClearing target folder...")
+            self._set_status_text(f"Preparing {PATCHER_MOD_NAME}...\nClearing target folder...")
             disabled_mods = self._disable_active_tslpatcher_mods()
             if disabled_mods:
                 self.refresh()
@@ -967,7 +968,7 @@ class Kotor2HKReassemblerTab(QWidget):
                                 log_prefix,
                                 "\n".join(
                                     [
-                                        "Preparing HK_REASSEMBLER...",
+                                        f"Preparing {PATCHER_MOD_NAME}...",
                                         f"Patch {entry_index}/{len(targets_by_entry)}: {label}",
                                         f"Targets processed: {processed}/{total_targets}",
                                         f"Files copied: {copied}",
@@ -984,7 +985,7 @@ class Kotor2HKReassemblerTab(QWidget):
                                 log_prefix,
                                 "\n".join(
                                     [
-                                        "Preparing HK_REASSEMBLER...",
+                                        f"Preparing {PATCHER_MOD_NAME}...",
                                         f"Patch {entry_index}/{len(targets_by_entry)}: {label}",
                                         f"Targets processed: {processed}/{total_targets}",
                                         f"Files copied: {copied}",
@@ -1004,7 +1005,7 @@ class Kotor2HKReassemblerTab(QWidget):
                             log_prefix,
                             "\n".join(
                                 [
-                                    "Preparing HK_REASSEMBLER...",
+                                    f"Preparing {PATCHER_MOD_NAME}...",
                                     f"Patch {entry_index}/{len(targets_by_entry)}: {label}",
                                     f"Targets processed: {processed}/{total_targets}",
                                     f"Files copied: {copied}",
@@ -1016,7 +1017,7 @@ class Kotor2HKReassemblerTab(QWidget):
                 log_prefix,
                 "\n".join(
                     [
-                        "Prepared HK_REASSEMBLER.",
+                        f"Prepared {PATCHER_MOD_NAME}.",
                         f"Patches scanned: {len(targets_by_entry)}",
                         f"Targets processed: {processed}",
                         f"Files copied: {copied}",
@@ -1226,7 +1227,7 @@ class Kotor2HKReassemblerTab(QWidget):
             self._set_status_text("No enabled HK patches to run.")
             return
 
-        hk_dir = Path(self._organizer.modsPath()) / "HK_REASSEMBLER"
+        hk_dir = Path(self._organizer.modsPath()) / PATCHER_MOD_NAME
         exe_path = Path(__file__).resolve().parent / "HoloPatcher.exe"
         temp_root = Path(__file__).resolve().parent / "temp"
         log_dir = Path(__file__).resolve().parent / "logs"
