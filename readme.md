@@ -1,4 +1,5 @@
-# <img width="256" height="93" alt="KOTORganizer" src="https://github.com/user-attachments/assets/e18fcbac-077f-4d0c-9598-f8a6547dd0ce" />
+# <img width="256" height="93" alt="KOTORganizer" src="https://raw.githubusercontent.com/J0-o/kotorganizer/refs/heads/main/kotorganizer_logo_256.png" />
+
 ## Mod Organizer 2 Plugin for Knights of the Old Republic
 
 Enables full modding support for both games in Mod Organizer 2.
