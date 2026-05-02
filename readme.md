@@ -26,8 +26,6 @@ It helps you:
 - hide or unhide individual textures
 - run an `Auto Fix` pass after larger changes
 
-If you spend time resolving visual conflicts, this is one of the most useful parts of the plugin.
-
 ### Patcher
 
 The `Patcher` tab gives MO2 a workflow for mods that ship with `tslpatchdata`.
@@ -47,8 +45,6 @@ The `Sync` tab installs a curated KSON( KOTOR JSON ;) ) build into MO2 from a ma
 - validate local archives before install
 - download missing archives when possible
 - rebuild the MO2 mod list from the synced manifest
-
-After sync completes, the plugin can continue into the patcher and texture cleanup workflow so the setup ends in a usable state instead of stopping halfway through.
 
 ## Other Useful Behavior
 
