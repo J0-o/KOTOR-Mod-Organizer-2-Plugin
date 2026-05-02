@@ -83,7 +83,7 @@ class _FetchWorker(QObject):
             selected_path, kson = self._latest_local_kson()
             kson["_selected_kson_name"] = selected_path.name
             self._cache_path.write_text(json.dumps(kson, indent=2), encoding="utf-8")
-            mod_count = len([mod for mod in kson.get("mods", []) if self._kson_mod_name(mod)])
+            mod_count = len([mod for mod in kson.get("mods", []) if Kotor2SyncTab._kson_mod_name(mod)])
             details = [
                 f"Loaded {mod_count} mods for {kson.get('game') or self._build_key}.",
                 f"KSON version: {_kson_version_text_from_name(selected_path.name)}",
@@ -114,7 +114,7 @@ class _FetchWorker(QObject):
                 text = self._download_text(source_url)
                 kson = json.loads(text)
                 mods = kson.get("mods", [])
-                if isinstance(mods, list) and any(self._kson_mod_name(mod) for mod in mods):
+                if isinstance(mods, list) and any(Kotor2SyncTab._kson_mod_name(mod) for mod in mods):
                     kson["_source_url"] = source_url
                     kson["_fetched_at"] = datetime.now(timezone.utc).isoformat()
                     return kson, source_url, file_name
@@ -155,7 +155,7 @@ class _FetchWorker(QObject):
             try:
                 kson = json.loads(path.read_text(encoding="utf-8"))
                 mods = kson.get("mods", [])
-                if isinstance(mods, list) and any(self._kson_mod_name(mod) for mod in mods):
+                if isinstance(mods, list) and any(Kotor2SyncTab._kson_mod_name(mod) for mod in mods):
                     return path, kson
                 errors.append(f"{path.name}: no mod entries found")
             except Exception as exc:
@@ -1161,7 +1161,7 @@ class Kotor2SyncTab(QWidget):
             except Exception:
                 source_url = ""
         for name in (selected_name, Path(source_url).name if source_url else "", cache_path.name):
-            version_text = self._kson_version_text_from_name(name)
+            version_text = _kson_version_text_from_name(name)
             if version_text != "unknown":
                 return version_text
         return self._latest_local_kson_version_text()
@@ -1169,7 +1169,7 @@ class Kotor2SyncTab(QWidget):
     # Return the newest timestamped local KSON version text.
     def _latest_local_kson_version_text(self) -> str:
         candidates = [
-            self._kson_version_text_from_name(path.name)
+            _kson_version_text_from_name(path.name)
             for path in self._kson_dir().glob("*.kson")
             if path.name != self._cache_path().name
             and self._is_game_kson_path(path.name)

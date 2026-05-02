@@ -33,6 +33,11 @@ def file_hash(path: Path) -> str:
     return xxh3_bytes(path.read_bytes())
 
 
+# Hash multiple files and return a path-to-hash mapping.
+def file_hashes(paths: list[Path]) -> dict[Path, str]:
+    return {path: file_hash(path) for path in paths}
+
+
 # Hash bytes with XXH3 or a CRC fallback.
 def xxh3_bytes(data: bytes) -> str:
     exe = xxhsum_exe()
