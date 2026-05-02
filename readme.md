@@ -16,6 +16,8 @@ MO2 does have a learning curve, but for advanced KOTOR/KOTOR2 builds, the extra 
 
 This plugin is mainly intended for larger KOTOR/KOTOR2 mod builds, repeatable installs, and users who want better insight into file conflicts.
 
+An auto downloader and installer is included to easily deply the Mod Builds from https://kotor.neocities.org/
+
 If you only install a few simple loose-file mods, this may be more tool than you need. If you are building a large mod list with many TSLPatcher mods, texture overrides, and compatibility concerns, MO2 provides a much cleaner workflow.
 
 ## Installing
@@ -25,6 +27,8 @@ Mod Organizer 2.5.3 Beta is required. The current unreleased beta builds include
 A beta build can be acquired from the [Mod Organizer 2 Discord](https://discord.com/invite/ewUVAqyrQX) in the `dev-build` channel. Development has been more active recently, so an official release should be available soon.
 
 Once you download and extract MO2, download and extract KOTORganizer to the MO2 directory. Launch ModOrganizer.exe and you can verify the plugin is loaded by opening the Info tab on the right.
+
+The sync tab can download and install the mod builds from https://kotor.neocities.org/
 
 ## Texture Management
 
