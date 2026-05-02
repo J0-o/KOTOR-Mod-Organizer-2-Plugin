@@ -1,61 +1,71 @@
 # <img width="256" height="93" alt="KOTORganizer" src="https://raw.githubusercontent.com/J0-o/kotorganizer/refs/heads/main/kotorganizer_logo_256.png" />
 
-## Mod Organizer 2 Plugin for Knights of the Old Republic
+# KOTORganizer MO2 Plugin
 
-Enables full modding support for both games in Mod Organizer 2.
+KOTORganizer extends Mod Organizer 2 for both `STAR WARS Knights of the Old Republic` and `STAR WARS Knights of the Old Republic II: The Sith Lords`.
 
-## Features
-- Assisted mod installation for archives containing:
-  - Multiple TSLPatcher installs  
-  - A single TSLPatcher install  
-  - Multiple loose-file install options  
-  - Simple loose-file installs
-- Modding support for all required game folders (the Data folder and non-game asset directories are excluded)
-- **Patcher Tab** – a TSLPatcher mod manager
-- **Save Files tab** with thumbnails
-- **Texture Conflicts tab**
-- Steam Workshop subscription detection (warns you to unsubscribe)
+## What It Does
 
-## Usage
-Mod Organizer 2 **3.x dev build** is required. This pre-release build is available on their [Discord](https://discord.gg/ewUVAqyrQX).
+- proper support for KOTOR 1 and KOTOR 2 inside MO2
+- folder mapping for KOTOR-specific paths such as `Override`, `Modules`, `Lips`, `Movies`, `StreamVoice`, and `TexturePacks`
+- `dialog.tlk` support from active mods
+- save-game integration
+- custom tabs for `Textures`, `Patcher`, `Sync`, and `Info`
+- KOTOR-specific mod layout validation and auto-fixing
 
-Download the KOTOR plugin from the [Releases](https://github.com/J0-o/KOTOR-Mod-Organizer-2-Plugin/releases) page and extract it into your MO2 directory.
+## The Main Tabs
 
-When downloading mods, place them in the **Downloads** folder under your MO2 directory or drag them directly into the **Downloads** tab.
+### Textures
 
-### Installing Mods
-- Double-click a mod in the **Downloads** tab to start installation.  
-  If the file/folder structure is recognized, MO2 will guide you through the process.
-- TSLPatcher mods are installed as:  
-  `MODNAME/tslpatchdata/`
-- Mods containing multiple TSLPatchers will prompt you to choose which ones to add.  
-  If you need to install multiple components from a single archive, double-click the archive again and install the next part under a different name.
-- TSLPatcher mods **are not managed by MO2**, so enabling them in the mod list is not required.  
-  Their **order still matters**, and Patcher Tab respects that order.
-- To manage TSLPatcher mods, select the **Patcher Tab** 
-  Check the TSLPatcher parts you want to install and click *Run*. They will be applied in **modlist order**.  
-  This creates a new mod called **HK_REASSEMBLER**. Enable it and move it wherever you want in your load order.
+The `Textures` tab is a conflict browser for texture files in the active mod stack.
 
-### Texture Conflicts Tab
-The textures tab shows texture conflicts across all installed mods.  
-This matters because the game accepts several texture formats (**TPC, TGA, DDS, TXI**), and the priority order can cause unexpected overrides.
+It helps you:
 
-- **TPC always overrides all other formats**, so these are shown as minor warnings.  
-- A **TPC and TXI with the same name is a major warning** because it can cause a game crash.  
-  To fix it, right-click the unwanted texture and choose *Hide*.
-- Minor warnings can be ignored, but remember that a TPC will always win the conflict.
+- see which mod currently wins for a texture
+- spot common texture conflicts
+- hide or unhide individual textures
+- run an `Auto Fix` pass after larger changes
 
-## General Mod Organizer 2 Guides
-https://www.modorganizer.org/
+### Patcher
 
-## Holo Patcher
-[Holo Patcher](https://github.com/th3w1zard1/HoloPatcher) is used to install TSLPatcher mods in the Patcher Tab mod manager.
+The `Patcher` tab gives MO2 a workflow for mods that ship with `tslpatchdata`.
 
-<img width="1916" height="1008" alt="image" src="https://github.com/user-attachments/assets/70e471f4-84d4-4428-ad11-b19a4aea18e2" />
-<img width="764" height="619" alt="image" src="https://github.com/user-attachments/assets/386be464-e4c8-4aac-80d5-294e8f2d7660" />
-<img width="769" height="611" alt="image" src="https://github.com/user-attachments/assets/0062b56a-a540-4990-b09f-34ec95d9a7e0" />
-<img width="760" height="732" alt="image" src="https://github.com/user-attachments/assets/e47df746-497d-4b8b-b575-b147f1c17bf5" />
+- detect TSLPatcher-based mods automatically
+- review available patches and enable only the ones you want
+- inspect patch details, including descriptions, INI data, parsed operations, and logs
+- prepare and run patches without leaving MO2
+- test individual patches in isolation
 
+### Sync
+
+The `Sync` tab installs a curated KSON( KOTOR JSON ;) ) build into MO2 from a manifest.
+
+- load or fetch the latest KSON file for the current game
+- show the full mod list from that manifest
+- validate local archives before install
+- download missing archives when possible
+- rebuild the MO2 mod list from the synced manifest
+
+## Other Useful Behavior
+
+### Save Support
+
+The plugin integrates the game's `saves` folder directly into MO2. Save entries can show timestamps, basic metadata, and screenshot previews.
+
+### Mod Layout Fixing
+
+KOTOR mods are often packed inconsistently. The plugin includes a KOTOR-specific mod data checker that can recognize common layouts and fix many of them automatically, especially loose files and patcher-style archives that would otherwise need manual cleanup.
+
+### Workshop Warning
+
+If the game is installed through Steam and Workshop content is detected, the plugin warns about it. The intended workflow is MO2-managed content, not a mixed MO2 plus Workshop setup.
+
+## Included Tools
+
+- `HoloPatcher.exe` - CLI support to run tlspatchdata mods
+- `DeadlyScraper.exe` - Scraper and downloader for deadlystream.com
+- `7z.exe` - archive managment 
+- `xxhsum.exe` - very very fast hashing tool
 
 
 
