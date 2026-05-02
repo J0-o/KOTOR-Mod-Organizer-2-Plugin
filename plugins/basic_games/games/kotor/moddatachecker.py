@@ -38,6 +38,7 @@ class KotorModDataCheckerBase(BasicModDataChecker):
         "modules": (".erf", ".rim", ".mod"),
         "streammusic": (".wav",),
         "streamsounds": (".wav",),
+        "streamwaves": (".wav",),
         "streamvoice": (".wav",),
         "texturepacks": (".erf",),
     }

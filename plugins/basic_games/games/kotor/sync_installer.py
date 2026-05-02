@@ -205,6 +205,8 @@ def _unique_mod_path(mods_path: Path, name: str) -> Path:
 def _install_mod(mod: dict, downloads_path: Path, mods_path: Path, warnings: list[str], progress, index: int, total: int):
     mod_name = str(mod.get("mod_name") or "").strip()
     archive_name = str(mod.get("archive_name") or "").strip()
+    local_archive_name = str(mod.get("local_archive_name") or "").strip()
+    selected_archive_name = local_archive_name or archive_name
     mod_path = mods_path / mod_name
     if mod_path.exists():
         old_mods_path = mods_path.parent / "_kotorganizer_sync_old_mods" / f"reinstall_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -217,27 +219,27 @@ def _install_mod(mod: dict, downloads_path: Path, mods_path: Path, warnings: lis
             return
     mod_path.mkdir(parents=True, exist_ok=True)
 
-    if not archive_name:
+    if not selected_archive_name:
         return
 
-    archive_path = _archive_path(downloads_path, archive_name)
+    archive_path = _archive_path(downloads_path, local_archive_name, archive_name)
     if archive_path is None:
-        warnings.append(f"{mod_name}: archive not found: {archive_name}")
+        warnings.append(f"{mod_name}: archive not found: {selected_archive_name}")
         return
 
     with tempfile.TemporaryDirectory(prefix="kotorganizer_sync_") as temp_dir:
         extract_path = Path(temp_dir)
         if progress:
-            progress(index, total, mod_name, f"Extracting {archive_name}")
+            progress(index, total, mod_name, f"Extracting {archive_path.name}")
         if not _extract_archive(archive_path, extract_path):
-            warnings.append(f"{mod_name}: failed to extract archive: {archive_name}")
+            warnings.append(f"{mod_name}: failed to extract archive: {archive_path.name}")
             return
         if progress:
             progress(index, total, mod_name, "Applying KSON actions")
         _apply_actions(mod, extract_path, mod_path, warnings)
         if progress:
             progress(index, total, mod_name, "Writing MO2 metadata")
-        _write_mod_meta(mod, mod_path, archive_name)
+        _write_mod_meta(mod, mod_path, archive_path.name)
         _mark_archive_meta_installed(mod, archive_path, mod_name)
 
 
@@ -377,11 +379,10 @@ def _mark_archive_meta_installed(mod: dict, archive_path: Path, mod_name: str):
 
 
 # Find an archive in downloads.
-def _archive_path(downloads_path: Path, archive_name: str) -> Path | None:
-    candidates = [
-        archive_name,
-        html.unescape(archive_name),
-    ]
+def _archive_path(downloads_path: Path, *archive_names: str) -> Path | None:
+    candidates: list[str] = []
+    for archive_name in archive_names:
+        candidates.extend([archive_name, html.unescape(archive_name)])
     seen: set[str] = set()
     for candidate in candidates:
         cleaned = candidate.strip().strip('"').strip("'")
