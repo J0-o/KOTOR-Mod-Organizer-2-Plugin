@@ -1,62 +1,55 @@
 ﻿import configparser
 import json
 import logging
+import os
 import re
 import shutil
+import stat
 import subprocess
-from dataclasses import dataclass
-from pathlib import Path
 import time
+from pathlib import Path
 
 import mobase
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QBrush, QColor, QPainter, QPalette, QDesktopServices
-from PyQt6.QtCore import QUrl
+from PyQt6.QtCore import QPoint, QTimer, Qt, QUrl
+from PyQt6.QtGui import QBrush, QColor, QDesktopServices, QPainter, QPalette
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QDialog,
     QHeaderView,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QApplication,
+    QStyle,
+    QStyleOptionSlider,
     QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
-    QStyle,
-    QStyleOptionSlider,
 )
-from tslpatcher_parser import TslPatcherOperation, parse_tslpatcher_ini
+from patcher_entries import PatchEntry as _PatcherEntry
+from patcher_entries import collect_patch_entries, find_patch_dir, read_ini_with_fallbacks
+from tslpatcher_parser import TslPatcherOperation
 from ui_theme import (
+    configure_refresh_button,
     configure_tree_widget,
     mo2_conflict_red,
+    refresh_mo2,
+    set_header_resize_mode,
+    tree_active_conflict_row_color,
     tree_base_color,
     tree_conflict_row_color,
     tree_highlight_color,
-    tree_active_conflict_row_color,
     tree_hover_stylesheet,
-    set_header_resize_mode,
     tree_selected_marker_color,
 )
 
 logger = logging.getLogger("mobase")
 PATCHER_MOD_NAME = "[ PATCHER FILES ]"
-
-
-def _read_ini_with_fallbacks(parser: configparser.ConfigParser, ini_path: Path) -> None:
-    last_error: Exception | None = None
-    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
-        try:
-            parser.read(ini_path, encoding=encoding)
-            return
-        except Exception as exc:
-            last_error = exc
-    if last_error is not None:
-        raise last_error
 
 
 # Convert a subset of RTF into readable plain text.
@@ -165,7 +158,7 @@ def _rtf_to_text(rtf: str) -> str:
 
 
 # Paint row markers next to the patch list scrollbar.
-class _HKConflictOverview(QWidget):
+class _PatcherConflictOverview(QWidget):
     # Cache the tree and the row colors to paint.
     def __init__(self, tree: QTreeWidget, parent: QWidget | None = None):
         super().__init__(parent)
@@ -234,7 +227,7 @@ class _HKConflictOverview(QWidget):
 
 
 # Sort patch rows by numeric priority when needed.
-class _HKPatchItem(QTreeWidgetItem):
+class _PatcherItem(QTreeWidgetItem):
     # Compare two rows using the active tree sort column.
     def __lt__(self, other: "QTreeWidgetItem") -> bool:
         tree = self.treeWidget()
@@ -246,29 +239,14 @@ class _HKPatchItem(QTreeWidgetItem):
         return super().__lt__(other)
 
 
-# Hold one parsed patch entry shown in the tree.
-@dataclass
-class _HKPatchEntry:
-    enabled: bool
-    priority: int
-    mod_name: str
-    patch_name: str
-    description: str
-    ini_short_path: str
-    destination: str
-    install_paths: str
-    files: str
-    required: str
-    operations: tuple[TslPatcherOperation, ...]
-
-
 # Show full details for one patch entry.
-class _HKPatchDetailsDialog(QDialog):
+class _PatcherDetailsDialog(QDialog):
     # Build the patch details dialog UI.
     def __init__(
         self,
         parent: QWidget | None,
-        entry: _HKPatchEntry,
+        owner: "Kotor2PatcherTab",
+        entry: _PatcherEntry,
         conflict_rows: list[tuple[str, str]],
         info_text: str,
         info_path: Path | None,
@@ -276,6 +254,8 @@ class _HKPatchDetailsDialog(QDialog):
         log_text: str,
     ):
         super().__init__(parent)
+        self._owner = owner
+        self._entry = entry
         self.setWindowTitle(f"{entry.mod_name} / {entry.patch_name}")
         self.resize(880, 620)
 
@@ -364,7 +344,7 @@ class _HKPatchDetailsDialog(QDialog):
             conflicts_tree.setCurrentItem(conflicts_tree.topLevelItem(0))
             conflicts_view.setPlainText(str(conflicts_tree.topLevelItem(0).data(0, Qt.ItemDataRole.UserRole) or ""))
         else:
-            conflicts_view.setPlainText("No enabled HK conflicts for this patch.")
+            conflicts_view.setPlainText("No enabled patch conflicts for this patch.")
         conflicts_tree.itemClicked.connect(
             lambda item, _column: conflicts_view.setPlainText(str(item.data(0, Qt.ItemDataRole.UserRole) or ""))
         )
@@ -377,11 +357,47 @@ class _HKPatchDetailsDialog(QDialog):
         log_view.setPlainText(log_text or "No log file found for this patch.")
         tabs.addTab(log_view, "Log")
 
+        test_tab = QWidget(self)
+        test_layout = QVBoxLayout(test_tab)
+        test_buttons = QHBoxLayout()
+        prepare_test_btn = QPushButton("Prepare Test", self)
+        prepare_test_btn.clicked.connect(self._prepare_test_install)
+        run_test_btn = QPushButton("Run Test", self)
+        run_test_btn.clicked.connect(self._run_test_install)
+        open_test_btn = QPushButton("Open Test Folder", self)
+        open_test_btn.clicked.connect(self._open_test_folder)
+        test_buttons.addWidget(prepare_test_btn)
+        test_buttons.addWidget(run_test_btn)
+        test_buttons.addWidget(open_test_btn)
+        test_buttons.addStretch()
+        test_layout.addLayout(test_buttons)
+
+        test_log = QPlainTextEdit(self)
+        test_log.setReadOnly(True)
+        test_log.setPlaceholderText("Single-patch prepare/run logs will appear here.")
+        self._test_log = test_log
+        test_layout.addWidget(test_log, 1)
+        tabs.addTab(test_tab, "Test")
+
+    # Prepare the selected test install.
+    def _prepare_test_install(self):
+        self._test_log.setPlainText(self._owner._prepare_test_entry(self._entry))
+
+    # Run the selected test install.
+    def _run_test_install(self):
+        self._test_log.setPlainText(self._owner._run_test_entry(self._entry))
+
+    # Open the test output folder.
+    def _open_test_folder(self):
+        test_dir = self._owner._test_entry_target_dir(self._entry)
+        if test_dir.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(test_dir)))
+
 
 # Show prepare and run controls for the patcher.
-class _HKRunnerDialog(QDialog):
+class _PatcherRunnerDialog(QDialog):
     # Build the runner dialog and wire its buttons.
-    def __init__(self, parent: QWidget | None, owner: "Kotor2HKReassemblerTab"):
+    def __init__(self, parent: QWidget | None, owner: "Kotor2PatcherTab"):
         super().__init__(parent)
         self._owner = owner
         self.setWindowTitle("Patcher")
@@ -390,14 +406,17 @@ class _HKRunnerDialog(QDialog):
         layout = QVBoxLayout(self)
         buttons = QHBoxLayout()
         self._prepare_btn = QPushButton("Prepare", self)
-        self._prepare_btn.clicked.connect(self._owner._prepare_hk_mod)
-        self._run_hk_btn = QPushButton("Start", self)
-        self._run_hk_btn.clicked.connect(self._owner._run_hk)
+        self._prepare_btn.clicked.connect(self._owner._prepare_patcher_mod)
+        self._run_patcher_btn = QPushButton("Start", self)
+        self._run_patcher_btn.clicked.connect(self._owner._run_patcher)
         self._stop_btn = QPushButton("Stop", self)
+        self._stop_btn.setAutoDefault(False)
+        self._stop_btn.setDefault(False)
+        self._stop_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._stop_btn.setEnabled(False)
-        self._stop_btn.clicked.connect(self._owner._stop_hk)
+        self._stop_btn.clicked.connect(self._owner._stop_patcher)
         buttons.addWidget(self._prepare_btn)
-        buttons.addWidget(self._run_hk_btn)
+        buttons.addWidget(self._run_patcher_btn)
         buttons.addWidget(self._stop_btn)
         buttons.addStretch()
         layout.addLayout(buttons)
@@ -415,38 +434,40 @@ class _HKRunnerDialog(QDialog):
     # Toggle the runner button state.
     def set_running(self, running: bool):
         self._prepare_btn.setEnabled(not running)
-        self._run_hk_btn.setEnabled(not running)
+        self._run_patcher_btn.setEnabled(not running)
         self._stop_btn.setEnabled(running)
 
 
 # Render the main patcher tab inside MO2.
-class Kotor2HKReassemblerTab(QWidget):
+class Kotor2PatcherTab(QWidget):
     # Build the patcher tab UI and event hooks.
     def __init__(self, parent: QWidget | None, organizer: mobase.IOrganizer, game):
         super().__init__(parent)
         self._organizer = organizer
         self._game = game
-        self._json_path = Path(__file__).resolve().parent / "tslpatch_order.json"
+        self._json_path = Path(self._organizer.profilePath()) / "tslpatch_order.json"
         self._active_conflict_key: str | None = None
-        self._entries: list[_HKPatchEntry] = []
+        self._entries: list[_PatcherEntry] = []
         self._last_profile_order: tuple[str, ...] = tuple()
         self._pending_checkbox_sync = False
         self._pending_click_entry_key: str | None = None
-        self._stop_hk_requested = False
-        self._current_hk_process: subprocess.Popen[str] | None = None
-        self._runner_dialog: _HKRunnerDialog | None = None
+        self._stop_patcher_requested = False
+        self._current_patcher_process: subprocess.Popen[str] | None = None
+        self._runner_dialog: _PatcherRunnerDialog | None = None
         self._runner_log_text = ""
+        self._refresh_pending = False
 
         layout = QVBoxLayout(self)
         header = QHBoxLayout()
         self._summary_label = QLabel("No patches loaded")
         refresh_btn = QPushButton("Refresh")
+        configure_refresh_button(refresh_btn)
         refresh_btn.clicked.connect(self._parse_and_refresh)
-        runner_btn = QPushButton("Run")
+        runner_btn = QPushButton("Patch")
         runner_btn.clicked.connect(self._open_runner_dialog)
+        header.addWidget(refresh_btn)
         header.addWidget(self._summary_label)
         header.addStretch()
-        header.addWidget(refresh_btn)
         header.addWidget(runner_btn)
         layout.addLayout(header)
 
@@ -463,6 +484,8 @@ class Kotor2HKReassemblerTab(QWidget):
         self._tree.itemChanged.connect(self._on_item_changed)
         self._tree.itemClicked.connect(self._on_item_clicked)
         self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         header_view = self._tree.header()
         header_view.setSectionsClickable(True)
         set_header_resize_mode(header_view, QHeaderView.ResizeMode.Interactive, 5)
@@ -472,7 +495,7 @@ class Kotor2HKReassemblerTab(QWidget):
         self._tree.setColumnWidth(3, 560)
         self._tree.setColumnWidth(4, 56)
         self._tree.sortItems(4, Qt.SortOrder.AscendingOrder)
-        self._conflict_overview = _HKConflictOverview(self._tree)
+        self._conflict_overview = _PatcherConflictOverview(self._tree)
         tree_layout = QHBoxLayout()
         tree_layout.setContentsMargins(0, 0, 0, 0)
         tree_layout.setSpacing(2)
@@ -492,32 +515,27 @@ class Kotor2HKReassemblerTab(QWidget):
         self._click_select_timer.setSingleShot(True)
         self._click_select_timer.setInterval(180)
         self._click_select_timer.timeout.connect(self._flush_pending_click)
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(250)
+        self._refresh_timer.timeout.connect(self._refresh_now)
 
-        organizer.onProfileChanged(lambda a, b: self.refresh())
-        organizer.modList().onModInstalled(lambda mod: self.refresh())
-        organizer.modList().onModRemoved(lambda mod: self.refresh())
-        organizer.modList().onModStateChanged(lambda mods: self.refresh())
+        organizer.onProfileChanged(lambda a, b: self.schedule_refresh())
+        organizer.modList().onModInstalled(lambda mod: self.schedule_refresh())
+        organizer.modList().onModRemoved(lambda mod: self.schedule_refresh())
+        organizer.modList().onModStateChanged(lambda mods: self.schedule_refresh())
 
-        self.refresh()
+        self.schedule_refresh(immediate=True)
 
     # Parse patch entries and refresh the tab.
     def _parse_and_refresh(self):
         if self._tree.topLevelItemCount():
             self._write_json()
-        self.refresh()
-        QMessageBox.information(self, "Patcher", f"Parsed and saved:\n{self._json_path}")
+        self.schedule_refresh(immediate=True)
 
     # Return mods in profile priority order.
     def _profile_mod_order(self) -> list[str]:
         return list(self._organizer.modList().allModsByProfilePriority())
-
-    # Return the tree base color.
-    def _theme_base_color(self) -> QColor:
-        return tree_base_color(self._tree)
-
-    # Return the tree highlight color.
-    def _theme_highlight_color(self) -> QColor:
-        return tree_highlight_color(self._tree)
 
     # Return MO2's conflict red color.
     def _mo2_conflict_red(self) -> QColor:
@@ -551,6 +569,8 @@ class Kotor2HKReassemblerTab(QWidget):
         super().showEvent(event)
         self._last_profile_order = tuple(self._profile_mod_order())
         self._order_watch_timer.start()
+        if self._refresh_pending or not self._tree.topLevelItemCount():
+            self.schedule_refresh(immediate=True)
 
     # Stop watching mod order changes while hidden.
     def hideEvent(self, event):
@@ -563,15 +583,11 @@ class Kotor2HKReassemblerTab(QWidget):
         if current_order == self._last_profile_order:
             return
         self._last_profile_order = current_order
-        self.refresh()
+        self.schedule_refresh()
 
     # Find the patch data folder inside one mod.
     def _find_patch_dir(self, mod_path: Path) -> Path | None:
-        for name in ("tslpatchdata", "TSLPatcherData", "patchdata"):
-            candidate = mod_path / name
-            if candidate.exists() and candidate.is_dir():
-                return candidate
-        return None
+        return find_patch_dir(mod_path)
 
     # Disable active TSLPatcher mods before preparing the patcher mod.
     def _disable_active_tslpatcher_mods(self) -> list[str]:
@@ -595,6 +611,9 @@ class Kotor2HKReassemblerTab(QWidget):
     # Load the saved enabled-state map from disk.
     def _load_enabled_state(self) -> dict[tuple[str, str], bool]:
         enabled: dict[tuple[str, str], bool] = {}
+        mod_list = self._organizer.modList()
+        for mod_name in self._profile_mod_order():
+            enabled[(mod_name, "Default")] = bool(mod_list.state(mod_name) & mobase.ModState.ACTIVE)
         if self._json_path.exists():
             try:
                 data = json.loads(self._json_path.read_text(encoding="utf-8"))
@@ -603,113 +622,23 @@ class Kotor2HKReassemblerTab(QWidget):
                     enabled[key] = bool(row.get("enabled", False))
                 return enabled
             except Exception as e:
-                logger.warning("[KOTOR2] Failed to read HK JSON state: %s", e)
+                logger.warning("[KOTOR2] Failed to read patcher JSON state: %s", e)
         return enabled
 
     # Collect patch entries from active patcher mods.
-    def _collect_patch_entries(self) -> list[_HKPatchEntry]:
+    def _collect_patch_entries(self) -> list[_PatcherEntry]:
         mods_root = Path(self._organizer.modsPath())
-        if not mods_root.exists():
-            return []
-
         order = self._profile_mod_order()
         enabled_state = self._load_enabled_state()
-        order_index = {name: index for index, name in enumerate(order)}
-        patch_mods = [
-            mod_path for mod_path in mods_root.iterdir()
-            if mod_path.is_dir() and self._find_patch_dir(mod_path) is not None
-        ]
-        patch_mods.sort(key=lambda path: order_index.get(path.name, -1), reverse=True)
-
-        entries: list[_HKPatchEntry] = []
-        for mod_path in patch_mods:
-            patch_dir = self._find_patch_dir(mod_path)
-            if patch_dir is None:
-                continue
-
-            namespaces_ini = patch_dir / "namespaces.ini"
-            if namespaces_ini.exists():
-                parser = configparser.ConfigParser(interpolation=None)
-                parser.optionxform = str
-                try:
-                    _read_ini_with_fallbacks(parser, namespaces_ini)
-                except Exception as e:
-                    logger.warning("[KOTOR2] Failed to read namespaces.ini for %s: %s", mod_path.name, e)
-                    continue
-
-                if not parser.has_section("Namespaces"):
-                    continue
-                namespace_names = [
-                    value.strip()
-                    for key, value in parser.items("Namespaces")
-                    if key.lower().startswith("namespace") and value.strip()
-                ]
-                for ns_name in namespace_names:
-                    if not parser.has_section(ns_name):
-                        continue
-
-                    ini_name = parser.get(ns_name, "IniName", fallback="").strip()
-                    data_path = parser.get(ns_name, "DataPath", fallback="").strip()
-                    description = parser.get(ns_name, "Description", fallback="").strip()
-                    final_path = patch_dir / data_path if data_path else patch_dir
-                    ini_candidates: list[Path] = []
-                    if ini_name:
-                        ini_candidates.extend(
-                            [
-                                final_path / ini_name,
-                                patch_dir / ini_name,
-                            ]
-                        )
-                    ini_candidates.extend(
-                        [
-                            final_path / "changes.ini",
-                            patch_dir / "changes.ini",
-                        ]
-                    )
-                    ini_path = next((candidate for candidate in ini_candidates if candidate.exists()), None)
-                    if ini_path is None:
-                        continue
-
-                    parsed = parse_tslpatcher_ini(ini_path)
-                    entries.append(
-                        _HKPatchEntry(
-                            enabled=enabled_state.get((mod_path.name, ns_name), False),
-                            priority=order_index.get(mod_path.name, -1),
-                            mod_name=mod_path.name,
-                            patch_name=ns_name,
-                            description=description or parsed.description,
-                            ini_short_path=str(ini_path.relative_to(patch_dir).as_posix()),
-                            destination="; ".join(parsed.destinations),
-                            install_paths="; ".join(parsed.install_paths),
-                            files="; ".join(parsed.files),
-                            required="; ".join(parsed.required),
-                            operations=parsed.operations,
-                        )
-                    )
-            else:
-                ini_path = patch_dir / "changes.ini"
-                if not ini_path.exists():
-                    continue
-                parsed = parse_tslpatcher_ini(ini_path)
-                entries.append(
-                    _HKPatchEntry(
-                        enabled=enabled_state.get((mod_path.name, "Default"), False),
-                        priority=order_index.get(mod_path.name, -1),
-                        mod_name=mod_path.name,
-                        patch_name="Default",
-                        description=parsed.description,
-                        ini_short_path="changes.ini",
-                        destination="; ".join(parsed.destinations),
-                        install_paths="; ".join(parsed.install_paths),
-                        files="; ".join(parsed.files),
-                        required="; ".join(parsed.required),
-                        operations=parsed.operations,
-                    )
-                )
-        return entries
+        mod_list = self._organizer.modList()
+        active_state = {
+            mod_name: bool(mod_list.state(mod_name) & mobase.ModState.ACTIVE)
+            for mod_name in order
+        }
+        return collect_patch_entries(mods_root, order, enabled_state, active_state)
 
     # Build human-readable duplicate conflict text.
-    def _build_duplicate_text(self, entries: list[_HKPatchEntry]) -> str:
+    def _build_duplicate_text(self, entries: list[_PatcherEntry]) -> str:
         dup_map: dict[str, set[str]] = {}
         for entry in entries:
             for operation in entry.operations:
@@ -737,7 +666,7 @@ class Kotor2HKReassemblerTab(QWidget):
         return suffix in {".tpc", ".tga", ".txi", ".mdl", ".mdx", ".wav"}
 
     # Build the set of virtual file targets needed by one patch.
-    def _entry_vfs_targets(self, entry: _HKPatchEntry) -> set[str]:
+    def _entry_vfs_targets(self, entry: _PatcherEntry) -> set[str]:
         targets: set[str] = set()
         required_targets = {
             self._normalize_relpath(required)
@@ -849,28 +778,118 @@ class Kotor2HKReassemblerTab(QWidget):
         return None, normalized, "\n".join(trace)
 
     # Clear the generated patcher mod directory.
-    def _clear_hk_mod_dir(self, hk_dir: Path):
-        hk_dir.mkdir(parents=True, exist_ok=True)
-        for child in hk_dir.iterdir():
+    def _clear_patcher_mod_dir(self, patcher_dir: Path):
+        patcher_dir.mkdir(parents=True, exist_ok=True)
+        for child in patcher_dir.iterdir():
             if child.name.lower() == "meta.ini":
                 continue
             if child.is_dir():
-                shutil.rmtree(child, ignore_errors=True)
+                self._remove_tree(child)
             else:
                 try:
+                    os.chmod(child, stat.S_IWRITE)
                     child.unlink()
                 except FileNotFoundError:
                     pass
 
     # Create dummy game executables required by HoloPatcher.
     @staticmethod
-    def _ensure_dummy_game_exes(hk_dir: Path):
+    def _ensure_dummy_game_exes(patcher_dir: Path):
         dummy_bytes = bytes(range(256))
         for exe_name in ("swkotor2.exe", "swkotor.exe"):
-            exe_path = hk_dir / exe_name
+            exe_path = patcher_dir / exe_name
             if exe_path.exists():
                 continue
             exe_path.write_bytes(dummy_bytes)
+
+    # Remove dummy game executables after patching.
+    @staticmethod
+    def _remove_dummy_game_exes(patcher_dir: Path):
+        for exe_name in ("swkotor2.exe", "swkotor.exe"):
+            exe_path = patcher_dir / exe_name
+            try:
+                if exe_path.exists():
+                    os.chmod(exe_path, stat.S_IWRITE)
+                    exe_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    # Prepare one target folder with the virtual files required by the given entries.
+    def _prepare_target_dir_for_entries(
+        self,
+        target_dir: Path,
+        entries: list[_PatcherEntry],
+        target_name: str,
+        log_prefix: str = "",
+        update_runner_log: bool = True,
+    ) -> str:
+        self._clear_patcher_mod_dir(target_dir)
+        self._ensure_dummy_game_exes(target_dir)
+
+        targets_by_entry = [
+            (entry, sorted(self._entry_vfs_targets(entry)))
+            for entry in entries
+        ]
+        total_targets = sum(len(targets) for _, targets in targets_by_entry)
+        copied = 0
+        processed = 0
+        seen_destinations: set[str] = set()
+        resolution_log: list[str] = []
+        resolution_cache: dict[str, tuple[Path | None, str, str]] = {}
+
+        for entry_index, (entry, targets) in enumerate(targets_by_entry, start=1):
+            if self._stop_patcher_requested:
+                return f"{log_prefix.rstrip()}\n\nPrepare stopped by user." if log_prefix else "Prepare stopped by user."
+
+            label = f"{entry.mod_name} / {entry.patch_name}"
+            progress = "\n".join(
+                [
+                    f"Preparing {target_name}...",
+                    f"Patch {entry_index}/{len(targets_by_entry)}: {label}",
+                    f"Targets processed: {processed}/{total_targets}",
+                    f"Files copied: {copied}",
+                ]
+            )
+            if update_runner_log:
+                self._set_status_with_prefix(log_prefix, progress)
+
+            for target in targets:
+                if self._stop_patcher_requested:
+                    return f"{log_prefix.rstrip()}\n\nPrepare stopped by user." if log_prefix else "Prepare stopped by user."
+
+                normalized_target = self._normalize_relpath(target)
+                cached_result = resolution_cache.get(normalized_target)
+                if cached_result is None:
+                    cached_result = self._resolve_vfs_file(normalized_target)
+                    resolution_cache[normalized_target] = cached_result
+                source, relative, resolution = cached_result
+                processed += 1
+                if not source or not source.exists():
+                    resolution_log.append(f"[MISS] {resolution}")
+                    continue
+
+                destination = target_dir / relative
+                destination_key = str(destination).lower()
+                if destination_key in seen_destinations:
+                    continue
+
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+                seen_destinations.add(destination_key)
+                copied += 1
+                resolution_log.append(f"[COPY] {resolution}\ncopy target='{relative}'")
+
+        return "\n".join(
+            [
+                f"Prepared {target_name}.",
+                f"Patches scanned: {len(targets_by_entry)}",
+                f"Targets processed: {processed}",
+                f"Files copied: {copied}",
+                "",
+                "Resolution log:",
+                *resolution_log,
+            ]
+        )
 
     # Replace the runner status text.
     def _set_status_text(self, text: str):
@@ -902,17 +921,19 @@ class Kotor2HKReassemblerTab(QWidget):
     # Show the runner dialog.
     def _open_runner_dialog(self):
         if self._runner_dialog is None:
-            self._runner_dialog = _HKRunnerDialog(self, self)
+            self._runner_dialog = _PatcherRunnerDialog(self, self)
             if self._runner_log_text:
                 self._runner_dialog.set_log_text(self._runner_log_text)
         self._runner_dialog.show()
         self._runner_dialog.raise_()
         self._runner_dialog.activateWindow()
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
 
     # Request cancellation of the current prepare or run.
-    def _stop_hk(self):
-        self._stop_hk_requested = True
-        process = self._current_hk_process
+    def _stop_patcher(self):
+        self._stop_patcher_requested = True
+        self._append_status_text("Stop requested.")
+        process = self._current_patcher_process
         if process is not None and process.poll() is None:
             try:
                 process.terminate()
@@ -920,138 +941,136 @@ class Kotor2HKReassemblerTab(QWidget):
                 pass
 
     # Prepare the generated patcher mod before running patches.
-    def _prepare_hk_mod(self, silent: bool = False, manage_busy: bool = True):
+    def _prepare_patcher_mod(self, silent: bool = False, manage_busy: bool = True):
         enabled_entries = [entry for entry in self._entries if entry.enabled]
         if not enabled_entries:
-            self._set_status_text("No enabled HK patches to prepare.")
+            self._set_status_text("No enabled patches to prepare.")
             return
 
-        hk_dir = Path(self._organizer.modsPath()) / PATCHER_MOD_NAME
-        self._stop_hk_requested = False
+        patcher_dir = Path(self._organizer.modsPath()) / PATCHER_MOD_NAME
+        self._stop_patcher_requested = False
         if manage_busy:
             self._set_runner_busy(True)
         try:
             self._set_status_text(f"Preparing {PATCHER_MOD_NAME}...\nClearing target folder...")
             disabled_mods = self._disable_active_tslpatcher_mods()
             if disabled_mods:
-                self.refresh()
+                self._refresh_now()
                 self._append_status_text(
                     "Disabled active TSLPatcher mods in MO2 before prepare:\n" + "\n".join(disabled_mods)
                 )
             log_prefix = self._runner_log_text
-            self._clear_hk_mod_dir(hk_dir)
-            self._ensure_dummy_game_exes(hk_dir)
-
-            targets_by_entry = [
-                (entry, sorted(self._entry_vfs_targets(entry)))
-                for entry in enabled_entries
-            ]
-            total_targets = sum(len(targets) for _, targets in targets_by_entry)
-            copied = 0
-            processed = 0
-            seen_destinations: set[str] = set()
-            resolution_log: list[str] = []
-            resolution_cache: dict[str, tuple[Path | None, str, str]] = {}
-
-            for entry_index, (entry, targets) in enumerate(targets_by_entry, start=1):
-                if self._stop_hk_requested:
-                    self._set_status_with_prefix(log_prefix, "Prepare stopped by user.")
-                    return
-
-                label = f"{entry.mod_name} / {entry.patch_name}"
-                self._set_status_with_prefix(
-                    log_prefix,
-                    "\n".join(
-                        [
-                            "Preparing Patcher...",
-                            f"Patch {entry_index}/{len(targets_by_entry)}: {label}",
-                            f"Targets processed: {processed}/{total_targets}",
-                            f"Files copied: {copied}",
-                        ]
-                    )
-                )
-
-                for target in targets:
-                    if self._stop_hk_requested:
-                        self._set_status_with_prefix(log_prefix, "Prepare stopped by user.")
-                        return
-
-                    normalized_target = self._normalize_relpath(target)
-                    cached_result = resolution_cache.get(normalized_target)
-                    if cached_result is None:
-                        cached_result = self._resolve_vfs_file(normalized_target)
-                        resolution_cache[normalized_target] = cached_result
-                    source, relative, resolution = cached_result
-                    processed += 1
-                    if not source or not source.exists():
-                        resolution_log.append(f"[MISS] {resolution}")
-                        if processed % 10 == 0:
-                            self._set_status_with_prefix(
-                                log_prefix,
-                                "\n".join(
-                                    [
-                                        f"Preparing {PATCHER_MOD_NAME}...",
-                                        f"Patch {entry_index}/{len(targets_by_entry)}: {label}",
-                                        f"Targets processed: {processed}/{total_targets}",
-                                        f"Files copied: {copied}",
-                                    ]
-                                )
-                            )
-                        continue
-
-                    destination = hk_dir / relative
-                    destination_key = str(destination).lower()
-                    if destination_key in seen_destinations:
-                        if processed % 10 == 0:
-                            self._set_status_with_prefix(
-                                log_prefix,
-                                "\n".join(
-                                    [
-                                        f"Preparing {PATCHER_MOD_NAME}...",
-                                        f"Patch {entry_index}/{len(targets_by_entry)}: {label}",
-                                        f"Targets processed: {processed}/{total_targets}",
-                                        f"Files copied: {copied}",
-                                    ]
-                                )
-                            )
-                        continue
-
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source, destination)
-                    seen_destinations.add(destination_key)
-                    copied += 1
-                    resolution_log.append(f"[COPY] {resolution}\ncopy target='{relative}'")
-
-                    if processed % 10 == 0:
-                        self._set_status_with_prefix(
-                            log_prefix,
-                            "\n".join(
-                                [
-                                    f"Preparing {PATCHER_MOD_NAME}...",
-                                    f"Patch {entry_index}/{len(targets_by_entry)}: {label}",
-                                    f"Targets processed: {processed}/{total_targets}",
-                                    f"Files copied: {copied}",
-                                ]
-                            )
-                        )
-
-            self._set_status_with_prefix(
-                log_prefix,
-                "\n".join(
-                    [
-                        f"Prepared {PATCHER_MOD_NAME}.",
-                        f"Patches scanned: {len(targets_by_entry)}",
-                        f"Targets processed: {processed}",
-                        f"Files copied: {copied}",
-                        "",
-                        "Resolution log:",
-                        *resolution_log,
-                    ]
-                )
-            )
+            prepare_log = self._prepare_target_dir_for_entries(patcher_dir, enabled_entries, PATCHER_MOD_NAME, log_prefix)
+            self._set_status_with_prefix(log_prefix, prepare_log)
         finally:
             if manage_busy:
                 self._set_runner_busy(False)
+
+    # Clear the generated [ PATCHER FILES ] folder without restaging patch files.
+    def clear_generated_patcher_mod(self):
+        patcher_dir = Path(self._organizer.modsPath()) / PATCHER_MOD_NAME
+        self._clear_patcher_mod_dir(patcher_dir)
+
+    # Return the isolated test target folder for one entry.
+    def _test_entry_target_dir(self, entry: _PatcherEntry) -> Path:
+        return Path(__file__).resolve().parent / "test" / self._safe_name(f"{entry.mod_name}_{entry.patch_name}")
+
+    # Prepare one patch entry into its isolated test target folder.
+    def _prepare_test_entry(self, entry: _PatcherEntry) -> str:
+        self._stop_patcher_requested = False
+        test_dir = self._test_entry_target_dir(entry)
+        return self._prepare_target_dir_for_entries(
+            test_dir,
+            [entry],
+            f"test folder for {entry.mod_name} / {entry.patch_name}",
+            update_runner_log=False,
+        )
+
+    # Run one patch entry against its isolated test target folder.
+    def _run_test_entry(self, entry: _PatcherEntry) -> str:
+        exe_path = Path(__file__).resolve().parent / "HoloPatcher.exe"
+        temp_root = Path(__file__).resolve().parent / "temp"
+        log_dir = Path(__file__).resolve().parent / "logs"
+        label = f"{entry.mod_name} / {entry.patch_name}"
+        test_dir = self._test_entry_target_dir(entry)
+
+        if not exe_path.exists():
+            return f"HoloPatcher not found:\n{exe_path}"
+
+        self._stop_patcher_requested = False
+        prepare_log = self._prepare_test_entry(entry)
+        if self._stop_patcher_requested:
+            return f"{prepare_log}\n\nRun stopped by user during prepare."
+
+        temp_root.mkdir(parents=True, exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        lines = [
+            f"=== Test Run: {label} ===",
+            "",
+            prepare_log,
+            "",
+            f"Installing into: {test_dir}",
+        ]
+
+        try:
+            temp_mod, error = self._stage_patch_for_run(entry, temp_root)
+            if temp_mod is None:
+                lines.extend(["", f"SKIPPED: {error}"])
+                return "\n".join(lines)
+
+            temp_patch = temp_mod / "tslpatchdata"
+            cmd = [
+                str(exe_path),
+                "--install",
+                "--game-dir",
+                str(test_dir),
+                "--tslpatchdata",
+                str(temp_patch),
+            ]
+            process = subprocess.Popen(cmd)
+            self._current_patcher_process = process
+            while process.poll() is None:
+                QApplication.processEvents()
+                if self._stop_patcher_requested:
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+                    break
+                time.sleep(0.05)
+
+            install_log = temp_mod / "installlog.txt"
+            if install_log.exists():
+                shutil.copy2(install_log, log_dir / f"{self._safe_name(label)}_test.txt")
+                raw_install_log = install_log.read_text(encoding="utf-8", errors="ignore").strip()
+                install_log_text, patch_error_count, patch_warning_count, patch_aborted = self._parse_install_log_summary(raw_install_log)
+                if install_log_text:
+                    lines.extend(["", "HoloPatcher log:", install_log_text])
+            else:
+                patch_error_count = 0
+                patch_warning_count = 0
+                patch_aborted = False
+
+            lines.append("")
+            if self._stop_patcher_requested:
+                lines.append("STOPPED")
+            elif patch_aborted or patch_error_count > 0:
+                lines.append("FAILED: install log reported errors")
+            elif process.returncode == 0:
+                status = "SUCCESS"
+                if patch_warning_count > 0:
+                    status += f" ({patch_warning_count} warning(s))"
+                lines.append(status)
+            else:
+                lines.append(f"FAILED: exit {process.returncode}")
+            return "\n".join(lines)
+        except Exception as exc:
+            lines.extend(["", f"ERROR: {exc}"])
+            return "\n".join(lines)
+        finally:
+            self._current_patcher_process = None
+            self._remove_tree_if_exists(temp_root)
 
     # Sanitize a string for temp file and log names.
     @staticmethod
@@ -1072,10 +1091,28 @@ class Kotor2HKReassemblerTab(QWidget):
                 key.append(part)
         return tuple(key)
 
+    # Remove a folder tree when it exists.
+    @classmethod
+    def _remove_tree_if_exists(cls, path: Path) -> None:
+        if path.exists():
+            cls._remove_tree(path)
+
+    # Remove a folder tree with Windows read-only retry.
+    @staticmethod
+    def _remove_tree(path: Path) -> None:
+        def _retry_writeable(function, failed_path, exc_info):
+            try:
+                os.chmod(failed_path, stat.S_IWRITE)
+                function(failed_path)
+            except Exception:
+                raise exc_info[1]
+
+        shutil.rmtree(path, onerror=_retry_writeable)
+
     # Return enabled entries in the current tree order.
-    def _run_order_entries(self) -> list[_HKPatchEntry]:
+    def _run_order_entries(self) -> list[_PatcherEntry]:
         by_key = {f"{entry.mod_name}::{entry.patch_name}": entry for entry in self._entries}
-        ordered_entries: list[_HKPatchEntry] = []
+        ordered_entries: list[_PatcherEntry] = []
         for i in range(self._tree.topLevelItemCount()):
             item = self._tree.topLevelItem(i)
             if item.checkState(0) != Qt.CheckState.Checked:
@@ -1115,12 +1152,12 @@ class Kotor2HKReassemblerTab(QWidget):
         return cleaned_text, error_count, warning_count, aborted
 
     # Find the base patch directory for an entry.
-    def _find_entry_patch_dir(self, entry: _HKPatchEntry) -> Path | None:
+    def _find_entry_patch_dir(self, entry: _PatcherEntry) -> Path | None:
         mod_path = Path(self._organizer.modsPath()) / entry.mod_name
         return self._find_patch_dir(mod_path)
 
     # Resolve the INI path for an entry.
-    def _entry_ini_path(self, entry: _HKPatchEntry) -> Path | None:
+    def _entry_ini_path(self, entry: _PatcherEntry) -> Path | None:
         patch_dir = self._find_entry_patch_dir(entry)
         if patch_dir is None:
             return None
@@ -1130,8 +1167,15 @@ class Kotor2HKReassemblerTab(QWidget):
         fallback = patch_dir / "changes.ini"
         return fallback if fallback.exists() else None
 
+    # Resolve the best folder to reveal for an entry.
+    def _entry_open_folder_path(self, entry: _PatcherEntry) -> Path | None:
+        ini_path = self._entry_ini_path(entry)
+        if ini_path is not None:
+            return ini_path.parent
+        return self._find_entry_patch_dir(entry)
+
     # Read the namespace-specific info filename for an entry.
-    def _entry_namespace_info_name(self, entry: _HKPatchEntry) -> str:
+    def _entry_namespace_info_name(self, entry: _PatcherEntry) -> str:
         patch_dir = self._find_entry_patch_dir(entry)
         if patch_dir is None:
             return ""
@@ -1143,7 +1187,7 @@ class Kotor2HKReassemblerTab(QWidget):
         parser = configparser.ConfigParser(interpolation=None)
         parser.optionxform = str
         try:
-            _read_ini_with_fallbacks(parser, namespaces_ini)
+            read_ini_with_fallbacks(parser, namespaces_ini)
         except Exception:
             return ""
 
@@ -1153,7 +1197,7 @@ class Kotor2HKReassemblerTab(QWidget):
         return parser.get(entry.patch_name, "InfoName", fallback="").strip()
 
     # Resolve the best info.rtf candidate for an entry.
-    def _entry_info_rtf_path(self, entry: _HKPatchEntry) -> Path | None:
+    def _entry_info_rtf_path(self, entry: _PatcherEntry) -> Path | None:
         ini_path = self._entry_ini_path(entry)
         patch_dir = self._find_entry_patch_dir(entry)
         info_name = self._entry_namespace_info_name(entry)
@@ -1182,7 +1226,7 @@ class Kotor2HKReassemblerTab(QWidget):
         return None
 
     # Return the stored log path for an entry.
-    def _entry_log_path(self, entry: _HKPatchEntry) -> Path:
+    def _entry_log_path(self, entry: _PatcherEntry) -> Path:
         log_dir = Path(__file__).resolve().parent / "logs"
         return log_dir / f"{self._safe_name(f'{entry.mod_name} / {entry.patch_name}')}.txt"
 
@@ -1197,7 +1241,7 @@ class Kotor2HKReassemblerTab(QWidget):
             return None
 
     # Stage one patch into a temp folder for execution.
-    def _stage_patch_for_run(self, entry: _HKPatchEntry, temp_root: Path) -> tuple[Path | None, str]:
+    def _stage_patch_for_run(self, entry: _PatcherEntry, temp_root: Path) -> tuple[Path | None, str]:
         patch_dir = self._find_entry_patch_dir(entry)
         if patch_dir is None:
             return None, "No tslpatchdata folder found"
@@ -1214,7 +1258,10 @@ class Kotor2HKReassemblerTab(QWidget):
         temp_mod = temp_root / self._safe_name(f"{entry.mod_name}_{entry.patch_name}")
         temp_patch = temp_mod / "tslpatchdata"
         if temp_mod.exists():
-            shutil.rmtree(temp_mod, ignore_errors=True)
+            try:
+                self._remove_tree(temp_mod)
+            except Exception as exc:
+                return None, f"Failed to clear temp folder: {exc}"
         temp_patch.mkdir(parents=True, exist_ok=True)
 
         ini_folder = ini_abs.parent
@@ -1243,13 +1290,13 @@ class Kotor2HKReassemblerTab(QWidget):
         return temp_mod, ""
 
     # Run the enabled patch entries through HoloPatcher.
-    def _run_hk(self):
+    def _run_patcher(self):
         enabled_entries = self._run_order_entries()
         if not enabled_entries:
-            self._set_status_text("No enabled HK patches to run.")
+            self._set_status_text("No enabled patches to run.")
             return
 
-        hk_dir = Path(self._organizer.modsPath()) / PATCHER_MOD_NAME
+        patcher_dir = Path(self._organizer.modsPath()) / PATCHER_MOD_NAME
         exe_path = Path(__file__).resolve().parent / "HoloPatcher.exe"
         temp_root = Path(__file__).resolve().parent / "temp"
         log_dir = Path(__file__).resolve().parent / "logs"
@@ -1258,17 +1305,17 @@ class Kotor2HKReassemblerTab(QWidget):
             self._set_status_text(f"HoloPatcher not found:\n{exe_path}")
             return
 
-        self._stop_hk_requested = False
+        self._stop_patcher_requested = False
         self._set_runner_busy(True)
         try:
-            self._prepare_hk_mod(silent=True, manage_busy=False)
-            if self._stop_hk_requested:
+            self._prepare_patcher_mod(silent=True, manage_busy=False)
+            if self._stop_patcher_requested:
                 self._append_status_text("Run stopped by user during prepare.")
                 return
             temp_root.mkdir(parents=True, exist_ok=True)
             log_dir.mkdir(parents=True, exist_ok=True)
 
-            lines = ["=== HK Run ===", ""]
+            lines = ["=== Patcher Run ===", ""]
             self._append_status_text("\n".join(lines))
             failures = 0
             warning_count = 0
@@ -1277,7 +1324,7 @@ class Kotor2HKReassemblerTab(QWidget):
             error_mods: list[str] = []
 
             for index, entry in enumerate(enabled_entries, start=1):
-                if self._stop_hk_requested:
+                if self._stop_patcher_requested:
                     lines.append("Run stopped by user.")
                     break
                 label = f"{entry.mod_name} / {entry.patch_name}"
@@ -1296,7 +1343,7 @@ class Kotor2HKReassemblerTab(QWidget):
                     str(exe_path),
                     "--install",
                     "--game-dir",
-                    str(hk_dir),
+                    str(patcher_dir),
                     "--tslpatchdata",
                     str(temp_patch),
                 ]
@@ -1304,10 +1351,10 @@ class Kotor2HKReassemblerTab(QWidget):
                     process = subprocess.Popen(
                         cmd,
                     )
-                    self._current_hk_process = process
+                    self._current_patcher_process = process
                     while process.poll() is None:
                         QApplication.processEvents()
-                        if self._stop_hk_requested:
+                        if self._stop_patcher_requested:
                             try:
                                 process.terminate()
                             except Exception:
@@ -1331,7 +1378,7 @@ class Kotor2HKReassemblerTab(QWidget):
                             error_mods.append(label)
                         if patch_aborted and label not in error_mods:
                             error_mods.append(label)
-                    if self._stop_hk_requested:
+                    if self._stop_patcher_requested:
                         lines.append("  STOPPED")
                         failures += 1
                         block = f"[{index}/{len(enabled_entries)}] {label}"
@@ -1361,10 +1408,10 @@ class Kotor2HKReassemblerTab(QWidget):
                     failures += 1
                     self._append_status_text(f"[{index}/{len(enabled_entries)}] {label}\n  ERROR: {exc}")
                 finally:
-                    self._current_hk_process = None
-                    shutil.rmtree(temp_mod, ignore_errors=True)
+                    self._current_patcher_process = None
+                    self._remove_tree_if_exists(temp_mod)
 
-            shutil.rmtree(temp_root, ignore_errors=True)
+            self._remove_tree_if_exists(temp_root)
             lines.append("")
             lines.append(f"Completed with {failures} failure(s).")
             summary_lines = [f"Completed with {failures} failure(s).", ""]
@@ -1384,7 +1431,9 @@ class Kotor2HKReassemblerTab(QWidget):
             self._append_status_text("\n".join(summary_lines))
         finally:
             self._set_runner_busy(False)
-            self._current_hk_process = None
+            self._current_patcher_process = None
+            self._remove_dummy_game_exes(patcher_dir)
+            refresh_mo2(self._organizer, self)
 
     # Collapse operation conflict keys into a stored string.
     @staticmethod
@@ -1418,7 +1467,7 @@ class Kotor2HKReassemblerTab(QWidget):
             active_keys = self._split_conflict_keys(str(active_item.data(0, Qt.ItemDataRole.UserRole + 5) or ""))
             if not active_keys:
                 return "Selected patch does not expose any parser-detected operations."
-            return f"No enabled HK conflicts for {active_label}."
+            return f"No enabled patch conflicts for {active_label}."
 
         return f"Conflicts for {active_label}:\n\n" + "\n\n".join(
             f"{label}\nShared operations:\n{details}" for label, details in rows
@@ -1457,7 +1506,7 @@ class Kotor2HKReassemblerTab(QWidget):
             item = self._tree.topLevelItem(i)
             if self._entry_key(item) == entry_key:
                 return self._selected_conflict_text(item)
-        return "Selected patch is no longer present in the current HK list."
+        return "Selected patch is no longer present in the current patch list."
 
     # Refresh the scrollbar overview colors.
     def _update_conflict_overview(self, *_args):
@@ -1476,7 +1525,7 @@ class Kotor2HKReassemblerTab(QWidget):
         self._conflict_overview.set_row_colors(row_colors)
 
     # Build row brushes for the active conflict set.
-    def _build_conflict_styles(self, entries: list[_HKPatchEntry]) -> tuple[dict[str, QBrush], dict[str, QColor]]:
+    def _build_conflict_styles(self, entries: list[_PatcherEntry]) -> tuple[dict[str, QBrush], dict[str, QColor]]:
         conflict_brushes: dict[str, QBrush] = {}
         overview_colors: dict[str, QColor] = {}
         if not self._active_conflict_key:
@@ -1519,7 +1568,7 @@ class Kotor2HKReassemblerTab(QWidget):
         self._tree.blockSignals(True)
         self._tree.clear()
         for entry in self._entries:
-            item = _HKPatchItem(["", entry.mod_name, entry.patch_name, entry.description, str(entry.priority)])
+            item = _PatcherItem(["", entry.mod_name, entry.patch_name, entry.description, str(entry.priority)])
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(0, Qt.CheckState.Checked if entry.enabled else Qt.CheckState.Unchecked)
             item.setData(4, Qt.ItemDataRole.UserRole, entry.priority)
@@ -1560,10 +1609,36 @@ class Kotor2HKReassemblerTab(QWidget):
                 "files": item.data(0, Qt.ItemDataRole.UserRole + 4) or "",
                 "required": item.data(0, Qt.ItemDataRole.UserRole + 3) or "",
             })
+        self._json_path.parent.mkdir(parents=True, exist_ok=True)
         self._json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    # Reload entries and refresh the patch tree.
+    # Queue or trigger a patch list refresh.
+    def schedule_refresh(self, immediate: bool = False):
+        self._refresh_pending = True
+        if not self.isVisible() and not immediate:
+            return
+        self._refresh_timer.start(0 if immediate else self._refresh_timer.interval())
+
+    # Preserve the public refresh entry point for explicit callers.
     def refresh(self):
+        self.schedule_refresh(immediate=True)
+
+    # Refresh patch entries and run them after sync.
+    def run_after_sync(self):
+        self._open_runner_dialog()
+        self._refresh_pending = False
+        self._last_profile_order = tuple(self._profile_mod_order())
+        self._entries = self._collect_patch_entries()
+        self._rebuild_tree_from_entries()
+        self._update_summary()
+        self._write_json()
+        self._run_patcher()
+
+    # Reload entries and refresh the patch tree.
+    def _refresh_now(self):
+        if not self.isVisible() and self._tree.topLevelItemCount():
+            return
+        self._refresh_pending = False
         self._last_profile_order = tuple(self._profile_mod_order())
         self._entries = self._collect_patch_entries()
         self._rebuild_tree_from_entries()
@@ -1624,6 +1699,36 @@ class Kotor2HKReassemblerTab(QWidget):
     def _on_item_double_clicked(self, item: QTreeWidgetItem, _column: int):
         self._click_select_timer.stop()
         self._pending_click_entry_key = None
+        self._show_item_information(item)
+
+    # Show the row context menu for the patcher list.
+    def _on_tree_context_menu(self, pos: QPoint):
+        item = self._tree.itemAt(pos)
+        if item is None:
+            return
+
+        self._click_select_timer.stop()
+        self._pending_click_entry_key = None
+        entry_key = self._entry_key(item)
+        entry = next(
+            (entry for entry in self._entries if f"{entry.mod_name}::{entry.patch_name}" == entry_key),
+            None,
+        )
+        menu = QMenu(self)
+        info_action = menu.addAction("Information")
+        open_folder_action = menu.addAction("Open in Explorer")
+        if entry is None or self._entry_open_folder_path(entry) is None:
+            open_folder_action.setEnabled(False)
+        chosen_action = menu.exec(self._tree.viewport().mapToGlobal(pos))
+        if chosen_action is info_action:
+            self._show_item_information(item)
+        elif chosen_action is open_folder_action and entry is not None:
+            folder_path = self._entry_open_folder_path(entry)
+            if folder_path is not None:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder_path)))
+
+    # Open the patch details dialog for a row.
+    def _show_item_information(self, item: QTreeWidgetItem):
         entry_key = self._entry_key(item)
         entry = next(
             (entry for entry in self._entries if f"{entry.mod_name}::{entry.patch_name}" == entry_key),
@@ -1638,5 +1743,6 @@ class Kotor2HKReassemblerTab(QWidget):
         ini_text = ini_path.read_text(encoding="utf-8", errors="ignore") if ini_path else ""
         log_text = log_path.read_text(encoding="utf-8", errors="ignore") if log_path.exists() else ""
         conflict_rows = self._selected_conflict_rows(item)
-        dialog = _HKPatchDetailsDialog(self, entry, conflict_rows, info_text, info_path, ini_text, log_text)
+        dialog = _PatcherDetailsDialog(self, self, entry, conflict_rows, info_text, info_path, ini_text, log_text)
         dialog.exec()
+

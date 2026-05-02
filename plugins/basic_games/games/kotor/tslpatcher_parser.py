@@ -268,7 +268,12 @@ def _extract_gff_paths(parser: configparser.ConfigParser, section_name: str) -> 
 
 
 # Extract the identity scope for a TLK patch section.
-def _extract_tlk_scope(parser: configparser.ConfigParser, value: str) -> tuple[str, ...]:
+def _extract_tlk_scope(parser: configparser.ConfigParser, key: str, value: str) -> tuple[str, ...]:
+    lower_key = key.lower().strip()
+    stripped_value = value.strip()
+    if lower_key.startswith("strref") and stripped_value.isdigit():
+        return (f"strref={_normalize_entry(stripped_value)}",)
+
     section_name = _find_section(parser, value)
     if not section_name or not parser.has_section(section_name):
         return (f"entry={_normalize_entry(value)}",)
@@ -358,15 +363,13 @@ def _parse_operations(parser: configparser.ConfigParser) -> tuple[TslPatcherOper
             for key, value in parser.items(section_name):
                 if not value.strip():
                     continue
-                if key.lower().startswith("strref") and value.strip().isdigit():
-                    continue
                 operations.append(
                     TslPatcherOperation(
                         resource_type="tlk",
                         action="patch",
                         target="dialog.tlk",
                         location="global",
-                        scope=_extract_tlk_scope(parser, value),
+                        scope=_extract_tlk_scope(parser, key, value),
                         source_section=section_name,
                     )
                 )

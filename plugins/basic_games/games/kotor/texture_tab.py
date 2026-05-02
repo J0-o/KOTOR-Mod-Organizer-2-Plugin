@@ -2,7 +2,7 @@ import logging
 from pathlib import Path
 
 import mobase
-from PyQt6.QtCore import QDateTime, QPoint, QTimer, QUrl, Qt
+from PyQt6.QtCore import QDateTime, QPoint, Qt, QTimer, QUrl
 from PyQt6.QtGui import QBrush, QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 from ui_theme import (
+    configure_refresh_button,
     configure_tree_widget,
     set_header_resize_mode,
     tree_major_conflict_color,
@@ -36,7 +37,39 @@ class _TextureItem(QTreeWidgetItem):
                 my_weight = self.data(0, Qt.ItemDataRole.UserRole + 2)
                 other_weight = other.data(0, Qt.ItemDataRole.UserRole + 2)
                 try:
-                    return int(my_weight) < int(other_weight)
+                    my_weight_int = int(my_weight)
+                    other_weight_int = int(other_weight)
+                    if my_weight_int != other_weight_int:
+                        return my_weight_int < other_weight_int
+                except Exception:
+                    pass
+                my_name = str(self.data(1, Qt.ItemDataRole.UserRole) or self.text(1)).lower()
+                other_name = str(other.data(1, Qt.ItemDataRole.UserRole) or other.text(1)).lower()
+                descending_error_sort = tree.header().sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
+                if my_name != other_name:
+                    return my_name > other_name if descending_error_sort else my_name < other_name
+                my_priority = self.data(6, Qt.ItemDataRole.UserRole)
+                other_priority = other.data(6, Qt.ItemDataRole.UserRole)
+                try:
+                    my_priority_int = int(my_priority)
+                    other_priority_int = int(other_priority)
+                    if my_priority_int != other_priority_int:
+                        return (
+                            my_priority_int > other_priority_int
+                            if descending_error_sort
+                            else my_priority_int < other_priority_int
+                        )
+                except Exception:
+                    pass
+            if tree.sortColumn() == 1:
+                my_name = str(self.data(1, Qt.ItemDataRole.UserRole) or self.text(1)).lower()
+                other_name = str(other.data(1, Qt.ItemDataRole.UserRole) or other.text(1)).lower()
+                if my_name != other_name:
+                    return my_name < other_name
+                my_priority = self.data(6, Qt.ItemDataRole.UserRole)
+                other_priority = other.data(6, Qt.ItemDataRole.UserRole)
+                try:
+                    return int(my_priority) < int(other_priority)
                 except Exception:
                     pass
             if tree.sortColumn() == 6:
@@ -72,16 +105,17 @@ class Kotor2TextureTab(QWidget):
         header = QHBoxLayout()
         self._count_label = QLabel("0 texture files")
         refresh_btn = QPushButton("Refresh")
+        configure_refresh_button(refresh_btn)
         refresh_btn.clicked.connect(self.refresh)
         auto_fix_btn = QPushButton("Auto Fix")
         auto_fix_btn.clicked.connect(self._auto_fix)
         unhide_btn = QPushButton("Unhide all")
         unhide_btn.clicked.connect(self._unhide_all)
+        header.addWidget(refresh_btn)
         header.addWidget(self._count_label)
         header.addStretch()
         header.addWidget(auto_fix_btn)
         header.addWidget(unhide_btn)
-        header.addWidget(refresh_btn)
         layout.addLayout(header)
 
         self._tree = QTreeWidget()
@@ -146,13 +180,46 @@ class Kotor2TextureTab(QWidget):
         if override_path.exists():
             yield "Game Override", override_path
 
+    # Yield override roots in winning priority order.
+    def _iter_winner_override_roots(self):
+        mod_entries: list[tuple[str, Path]] = []
+        game_entry: tuple[str, Path] | None = None
+        for source, root in self._iter_override_roots():
+            if source.startswith("Mod: "):
+                mod_entries.append((source, root))
+            else:
+                game_entry = (source, root)
+        yield from reversed(mod_entries)
+        if game_entry:
+            yield game_entry
+
     # Force an immediate refresh pass.
     def refresh(self):
         self.schedule_refresh(immediate=True)
 
+    # Refresh, auto-fix, and refresh again after sync.
+    def run_auto_fix_after_sync(self):
+        self._refresh_now(force=True)
+        self._auto_fix()
+        self._refresh_now(force=True)
+
+    # Unhide every hidden texture, then refresh and auto-fix after sync.
+    def run_unhide_all_and_auto_fix_after_sync(self):
+        self._refresh_now(force=True)
+        self._unhide_all()
+        self._refresh_now(force=True)
+        self._auto_fix()
+        self._refresh_now(force=True)
+
+    # Unhide every hidden texture before building a KSON.
+    def run_unhide_all_for_build(self):
+        self._refresh_now(force=True)
+        self._unhide_all()
+        self._refresh_now(force=True)
+
     # Scan override roots and rebuild the texture table.
-    def _refresh_now(self):
-        if not self.isVisible():
+    def _refresh_now(self, force: bool = False):
+        if not force and not self.isVisible():
             return
         self._refresh_pending = False
         winners: dict[str, tuple[str, str]] = {}
@@ -277,6 +344,7 @@ class Kotor2TextureTab(QWidget):
             row.setData(0, Qt.ItemDataRole.UserRole + 1, entry["hidden"])
             row.setData(0, Qt.ItemDataRole.UserRole + 2, weight)
             row.setData(0, Qt.ItemDataRole.UserRole + 4, entry["base"])
+            row.setData(1, Qt.ItemDataRole.UserRole, Path(entry["base"]).name)
             row.setData(6, Qt.ItemDataRole.UserRole, entry["priority"])
             self._tree.addTopLevelItem(row)
 
@@ -344,9 +412,18 @@ class Kotor2TextureTab(QWidget):
             return
         is_hidden = bool(item.data(0, Qt.ItemDataRole.UserRole + 1))
         menu = QMenu(self)
-        action = menu.addAction("Unhide" if is_hidden else "Hide (.mohidden)")
-        action.triggered.connect(lambda: self._toggle_hidden(path, is_hidden))
-        menu.exec(self._tree.viewport().mapToGlobal(pos))
+        open_action = menu.addAction("Open")
+        open_explorer_action = menu.addAction("Open in Explorer")
+        toggle_action = menu.addAction("Unhide" if is_hidden else "Hide (.mohidden)")
+        chosen_action = menu.exec(self._tree.viewport().mapToGlobal(pos))
+        if chosen_action is open_action and path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        elif chosen_action is open_explorer_action:
+            reveal_path = path.parent if path.exists() else path.parent
+            if reveal_path.exists():
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(reveal_path)))
+        elif chosen_action is toggle_action:
+            self._toggle_hidden(path, is_hidden)
 
     # Toggle the .mohidden suffix for a texture file.
     def _toggle_hidden(self, path: Path, currently_hidden: bool):
@@ -363,41 +440,39 @@ class Kotor2TextureTab(QWidget):
         finally:
             self.refresh()
 
-    # Build the currently winning visible texture files by normalized base.
-    def _visible_winner_files_by_base(self) -> dict[str, dict[str, Path]]:
-        winners: dict[str, Path] = {}
+    # Build visible texture files by base and extension in winner order.
+    def _visible_files_by_base(self) -> dict[str, dict[str, list[Path]]]:
+        visible_by_base: dict[str, dict[str, list[Path]]] = {}
 
-        for _source, root in self._iter_override_roots():
+        for _source, root in self._iter_winner_override_roots():
             for file in root.rglob("*"):
                 if not file.is_file() or file.name.endswith(".mohidden"):
                     continue
                 if file.suffix.lower() not in self._EXTENSIONS:
                     continue
                 rel = file.relative_to(root).as_posix()
-                key = rel.lower()
-                if key not in winners:
-                    winners[key] = file
-
-        visible_by_base: dict[str, dict[str, Path]] = {}
-        for rel, path in winners.items():
-            base = Path(rel).with_suffix("").as_posix().lower()
-            visible_by_base.setdefault(base, {})[path.suffix.lower()] = path
+                base = Path(rel).with_suffix("").as_posix().lower()
+                ext = file.suffix.lower()
+                visible_by_base.setdefault(base, {}).setdefault(ext, []).append(file)
 
         return visible_by_base
 
     # Hide lower-priority visible texture variants for each texture base.
     def _auto_fix(self):
         while True:
-            visible_by_base = self._visible_winner_files_by_base()
+            visible_by_base = self._visible_files_by_base()
             to_hide: list[Path] = []
 
             for files in visible_by_base.values():
-                winner_exts = self._winner_extensions(files)
+                winner_files = {ext: paths[0] for ext, paths in files.items() if paths}
+                winner_exts = self._winner_extensions(winner_files)
                 if not winner_exts:
                     continue
-                for ext, path in files.items():
-                    if ext not in winner_exts:
-                        to_hide.append(path)
+                for ext, paths in files.items():
+                    if ext in winner_exts:
+                        to_hide.extend(paths[1:])
+                    else:
+                        to_hide.extend(paths)
 
             if not to_hide:
                 break
@@ -431,23 +506,25 @@ class Kotor2TextureTab(QWidget):
         self.refresh()
 
     # Return the visible extension set to keep for one texture base.
+    # Choose the visible texture extensions.
     @staticmethod
     def _winner_extensions(files: dict[str, Path]) -> set[str]:
-        if ".tpc" in files:
+        if not files:
+            return set()
+
+        winner_ext = next(iter(files))
+        if winner_ext == ".tga":
+            return {".tga", ".txi"} if ".txi" in files else {".tga"}
+        if winner_ext == ".dds":
+            return {".dds", ".txi"} if ".txi" in files else {".dds"}
+        if winner_ext == ".tpc":
             return {".tpc"}
-        if ".tga" in files and ".txi" not in files:
-            return {".tga"}
-        if ".tga" in files and ".txi" in files:
-            return {".tga", ".txi"}
-        if ".dds" in files and ".txi" not in files:
-            return {".dds"}
-        if ".dds" in files and ".txi" in files:
-            return {".dds", ".txi"}
-        if ".txi" in files:
+        if winner_ext == ".txi":
             return {".txi"}
         return set()
 
     # Format a byte count for display.
+    # Format a byte size.
     @staticmethod
     def _format_size(size: int) -> str:
         units = ["B", "KB", "MB", "GB"]

@@ -27,10 +27,8 @@ from basic_games.basic_features import (
     BasicGameSaveGameInfo,
 )
 from import_probe import KOTOR2_IMPORT_PROBE
-from patcher_tab import Kotor2HKReassemblerTab as KotorPatcherTab
 from shared_game import KotorGameMixin, KotorModDataCheckerBase
 from saves_tab import Kotor2SaveGame as KotorSaveGame, parse_kotor2_save_metadata as parse_kotor_save_metadata
-from texture_tab import Kotor2TextureTab as KotorTextureTab
 
 logger = logging.getLogger("mobase")
 if _plugin_dir_added:
@@ -53,13 +51,15 @@ class StarWarsKotorGame(KotorGameMixin, BasicGame, mobase.IPluginFileMapper):
     def __init__(self):
         BasicGame.__init__(self)
         mobase.IPluginFileMapper.__init__(self)
-        self._texture_tab: KotorTextureTab | None = None
-        self._patcher_tab: KotorPatcherTab | None = None
+        self._texture_tab = None
+        self._patcher_tab = None
+        self._sync_tab = None
+        self._info_tab = None
         self._platform_logged = False
 
     Name = "STAR WARS Knights of the Old Republic"
     Author = "J"
-    Version = "1.4.1"
+    Version = "2.2.0"
 
     GameName = Name
     GameShortName = "kotor"
@@ -103,7 +103,7 @@ class StarWarsKotorGame(KotorGameMixin, BasicGame, mobase.IPluginFileMapper):
 
     # Insert the custom saves, textures, and patcher tabs into MO2.
     def _init_custom_tabs(self, main_window: QMainWindow):
-        self._init_custom_tabs_common(main_window, KotorTextureTab, KotorPatcherTab)
+        self._init_custom_tabs_common(main_window)
 
     # Return the INI files associated with the game.
     def iniFiles(self):

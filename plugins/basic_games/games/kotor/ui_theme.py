@@ -1,9 +1,14 @@
 import configparser
+import logging
 import re
 from pathlib import Path
 
-from PyQt6.QtGui import QColor, QPalette
-from PyQt6.QtWidgets import QAbstractItemView, QHeaderView, QTreeWidget, QWidget
+from PyQt6.QtCore import QSize, QTimer
+from PyQt6.QtGui import QAction, QColor, QPalette
+from PyQt6.QtWidgets import QAbstractItemView, QHeaderView, QPushButton, QStyle, QToolButton, QTreeWidget, QWidget
+
+
+logger = logging.getLogger("mobase")
 
 
 # Blend two colors by a fixed alpha amount.
@@ -70,6 +75,19 @@ def mo2_conflict_red() -> QColor:
     return mo2_setting_color("overwritingLooseFilesColor", QColor(255, 0, 0))
 
 
+# Match MO2's compact refresh buttons used by built-in tabs.
+def configure_refresh_button(button: QPushButton) -> None:
+    button.setText("Refresh")
+    button.setIcon(button.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+    button.setIconSize(QSize(16, 16))
+
+
+# Match MO2's compact download-style buttons.
+def configure_download_button(button: QPushButton) -> None:
+    button.setIcon(button.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown))
+    button.setIconSize(QSize(16, 16))
+
+
 # Return the tree base background color.
 def tree_base_color(tree: QTreeWidget) -> QColor:
     return tree.palette().color(QPalette.ColorRole.Base)
@@ -132,16 +150,6 @@ def tree_hover_stylesheet(tree: QTreeWidget, alpha: float = 0.34) -> str:
     )
 
 
-# Build a shared hover stylesheet for tree and text widgets.
-def hover_stylesheet(widget: QWidget, alpha: float = 0.34) -> str:
-    hover = tree_hover_color(widget, alpha)
-    return (
-        "QTreeWidget::item:hover, QPlainTextEdit:hover, QTextEdit:hover {"
-        f" background-color: rgba({hover.red()}, {hover.green()}, {hover.blue()}, 160);"
-        "}"
-    )
-
-
 # Apply the common base configuration for tree widgets.
 def configure_tree_widget(
     tree: QTreeWidget,
@@ -165,3 +173,47 @@ def configure_tree_widget(
 def set_header_resize_mode(header: QHeaderView, mode: QHeaderView.ResizeMode, count: int) -> None:
     for col in range(count):
         header.setSectionResizeMode(col, mode)
+
+
+# Trigger MO2's refresh after the current UI task finishes.
+def refresh_mo2(organizer, widget: QWidget | None = None) -> None:
+    QTimer.singleShot(250, lambda: _refresh_mo2_now(organizer, widget))
+
+
+# Run the actual MO2 refresh attempt.
+def _refresh_mo2_now(organizer, widget: QWidget | None = None) -> bool:
+    refresh = getattr(organizer, "refresh", None)
+    if callable(refresh):
+        try:
+            refresh()
+            logger.info("[KOTOR] Triggered MO2 refresh through organizer.refresh().")
+            return True
+        except Exception as exc:
+            logger.warning(f"[KOTOR] organizer.refresh() failed: {exc}")
+
+    if widget is None:
+        logger.warning("[KOTOR] Could not trigger MO2 refresh: no widget fallback.")
+        return False
+
+    window = widget.window()
+    for action in window.findChildren(QAction):
+        text = action.text().replace("&", "").strip().lower()
+        object_name = action.objectName().lower()
+        tool_tip = action.toolTip().replace("&", "").strip().lower()
+        if text == "refresh" or tool_tip == "refresh" or "refresh" in object_name:
+            action.trigger()
+            logger.info(f"[KOTOR] Triggered MO2 refresh through QAction {action.objectName()}.")
+            return True
+
+    for button in window.findChildren((QPushButton, QToolButton)):
+        text = button.text().replace("&", "").strip().lower()
+        object_name = button.objectName().lower()
+        tool_tip = button.toolTip().replace("&", "").strip().lower()
+        status_tip = button.statusTip().replace("&", "").strip().lower()
+        if text == "refresh" or tool_tip == "refresh" or status_tip == "refresh" or "refresh" in object_name:
+            button.click()
+            logger.info(f"[KOTOR] Triggered MO2 refresh through button {button.objectName()}.")
+            return True
+
+    logger.warning("[KOTOR] Could not find an MO2 refresh action or button.")
+    return False
