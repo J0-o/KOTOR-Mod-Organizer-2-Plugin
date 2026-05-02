@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from archive_service import ArchiveService
 from hash_utils import file_hash
 from sync_installer import SyncInstallResult, install_kson_build
 from ui_theme import configure_download_button, configure_refresh_button, configure_tree_widget, refresh_mo2, set_header_resize_mode
@@ -41,7 +42,6 @@ from ui_theme import configure_download_button, configure_refresh_button, config
 logger = logging.getLogger("mobase")
 
 
-_FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _WM_CLOSE = 0x0010
 
 
@@ -233,6 +233,63 @@ class _SyncWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class _ValidationWorker(QObject):
+    progress = pyqtSignal(int, int, int, object)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    # Store validation inputs for the worker.
+    def __init__(self, cache_path: Path, downloads_path: Path, kson: dict, row_specs: list[dict]):
+        super().__init__()
+        self._cache_path = cache_path
+        self._downloads_path = downloads_path
+        self._kson = kson
+        self._row_specs = row_specs
+
+    # Validate archives without blocking the UI thread.
+    def run(self):
+        try:
+            runner = ArchiveService(self._downloads_path, self._cache_path)
+            runner.prepare_tslrcm_archives_for_validation(self._kson)
+
+            mods_by_name: dict[str, list[dict]] = {}
+            for mod in self._kson.get("mods", []):
+                if not isinstance(mod, dict):
+                    continue
+                mod_name = runner.kson_mod_name(mod)
+                if mod_name:
+                    mods_by_name.setdefault(mod_name, []).append(mod)
+
+            hash_cache: dict[Path, str] = {}
+            counts = {"ok": 0, "empty": 0, "missing": 0, "mismatch": 0, "skipped": 0}
+            total = len(self._row_specs)
+
+            for current, spec in enumerate(self._row_specs, start=1):
+                mod = spec.get("mod")
+                if not isinstance(mod, dict):
+                    matches = mods_by_name.get(str(spec.get("mod_name") or ""), [])
+                    mod = matches.pop(0) if matches else None
+                if not isinstance(mod, dict):
+                    result = runner._result(
+                        "skipped",
+                        "Skipped",
+                        str(spec.get("mod_name") or ""),
+                        "",
+                        "",
+                        None,
+                        "",
+                        "No matching KSON mod entry was found for this row.",
+                    )
+                else:
+                    result = runner.validate_mod(mod, hash_cache=hash_cache)
+                counts[str(result.get("bucket") or "skipped")] += 1
+                self.progress.emit(current, total, int(spec.get("row_index", current - 1)), result)
+
+            self.finished.emit(counts)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 # Render the Sync tab inside MO2.
 class Kotor2SyncTab(QWidget):
     _FETCH_TIMEOUT_SECONDS = 20
@@ -252,6 +309,9 @@ class Kotor2SyncTab(QWidget):
         self._browser_waiting: tuple[QTreeWidgetItem, dict, Path, str, float, str, set[str]] | None = None
         self._fetch_thread: QThread | None = None
         self._fetch_worker: _FetchWorker | None = None
+        self._validation_thread: QThread | None = None
+        self._validation_worker: _ValidationWorker | None = None
+        self._validation_sorting_enabled: bool | None = None
         self._sync_thread: QThread | None = None
         self._sync_worker: _SyncWorker | None = None
         self._sync_progress_lines: list[str] = []
@@ -317,7 +377,7 @@ class Kotor2SyncTab(QWidget):
 
     # Run the full sync-tab refresh flow from the single Refresh button.
     def _refresh_fetch_validate(self):
-        if self._fetch_thread is not None:
+        if self._fetch_thread is not None or self._validation_thread is not None:
             return
         self.refresh()
         self._start_fetch_latest_manifest()
@@ -411,7 +471,7 @@ class Kotor2SyncTab(QWidget):
 
     # Download missing archives one at a time from the cached KSON.
     def _download_missing_archives(self):
-        if self._download_process is not None or self._browser_waiting is not None:
+        if self._download_process is not None or self._browser_waiting is not None or self._validation_thread is not None:
             return
         self._download_queue = []
         for index in range(self._tree.topLevelItemCount()):
@@ -537,7 +597,8 @@ class Kotor2SyncTab(QWidget):
             self._mark_downloaded(row, mod, archive_path, "Downloaded with DeadlyScraper.")
             QTimer.singleShot(0, self._process_next_download)
             return
-        downloaded_path = self._newest_download_for_url(str(mod.get("url") or ""))
+        existing_names = context[2] if context is not None else set()
+        downloaded_path = self._detect_new_download(existing_names)
         if downloaded_path is not None:
             self._mark_downloaded(row, mod, downloaded_path, "Downloaded with DeadlyScraper.")
             QTimer.singleShot(0, self._process_next_download)
@@ -704,39 +765,14 @@ class Kotor2SyncTab(QWidget):
 
     # Detect a completed browser download path.
     def _detect_browser_download(self, expected_path: Path, existing_names: set[str]) -> Path | None:
-        if (
-            expected_path.name
-            and expected_path.is_file()
-            and not self._is_incomplete_download_name(expected_path.name)
-            and not (expected_path.parent / f"{expected_path.name}.crdownload").exists()
-        ):
-            return expected_path
+        return self._archive_service().detect_browser_download(expected_path, existing_names)
 
-        new_files = [
-            path
-            for path in expected_path.parent.iterdir()
-            if path.is_file()
-            and path.name not in existing_names
-            and not self._is_incomplete_download_name(path.name)
-        ]
-        if len(new_files) != 1:
-            return None
-
-        return new_files[0]
+    def _detect_new_download(self, existing_names: set[str]) -> Path | None:
+        return self._archive_service().detect_new_download(existing_names)
 
     @staticmethod
     def _is_incomplete_download_name(name: str) -> bool:
-        lower_name = name.casefold()
-        return (
-            lower_name.endswith(".crdownload")
-            or lower_name.endswith(".tmp")
-            or lower_name.endswith(".meta")
-            or lower_name.endswith(".part")
-            or lower_name.endswith(".partial")
-            or lower_name.endswith(".download")
-            or lower_name.endswith(".opdownload")
-            or lower_name.endswith(".unfinished")
-        )
+        return ArchiveService.is_incomplete_download_name(name)
 
     # Close only the Edge process started for this sandboxed profile when possible.
     def _close_browser_process(self):
@@ -804,10 +840,11 @@ class Kotor2SyncTab(QWidget):
         archive_path, wrap_result = self._wrap_loose_download(archive_path, archive_name)
         if wrap_result:
             result = f"{result}\n{wrap_result}"
-        self._capture_downloaded_archive_metadata(mod, archive_path)
-        row.setText(4, self._display_archive_name(mod))
-        self._write_archive_meta(mod, archive_path)
         validation_result = self._validate_archive_row_from_mod(row, mod)
+        if validation_result == "ok":
+            self._capture_downloaded_archive_metadata(mod, archive_path)
+            row.setText(4, self._display_archive_name(mod))
+            self._write_archive_meta(mod, archive_path)
         details = str(row.data(0, Qt.ItemDataRole.UserRole) or "")
         if details:
             details = details.replace(f"Result: {row.text(0)}", f"Result: {result}", 1)
@@ -932,8 +969,10 @@ class Kotor2SyncTab(QWidget):
     def _clear_fetch_worker(self):
         self._fetch_thread = None
         self._fetch_worker = None
-        self._refresh_btn.setEnabled(True)
-        self._download_btn.setEnabled(True)
+        if self._validation_thread is None:
+            self._refresh_btn.setEnabled(True)
+            self._download_btn.setEnabled(True)
+        self._update_sync_button_state()
 
     # Show details for the current row.
     def _update_details(self):
@@ -961,6 +1000,9 @@ class Kotor2SyncTab(QWidget):
 
         if self._download_process is not None or self._browser_waiting is not None:
             download_action.setEnabled(False)
+        if self._validation_thread is not None:
+            download_action.setEnabled(False)
+            hash_action.setEnabled(False)
         if not url:
             webpage_action.setEnabled(False)
         if not archive_name:
@@ -981,7 +1023,7 @@ class Kotor2SyncTab(QWidget):
 
     # Download the archive for one selected row.
     def _download_selected_row(self, row: QTreeWidgetItem, mod: dict):
-        if self._download_process is not None or self._browser_waiting is not None:
+        if self._download_process is not None or self._browser_waiting is not None or self._validation_thread is not None:
             return
         self._download_queue = [(row, mod)]
         self._download_btn.setEnabled(False)
@@ -989,6 +1031,8 @@ class Kotor2SyncTab(QWidget):
 
     # Validate one archive row.
     def _validate_archive_row(self, row: QTreeWidgetItem):
+        if self._validation_thread is not None:
+            return
         mod = row.data(0, Qt.ItemDataRole.UserRole + 1)
         if not isinstance(mod, dict):
             return
@@ -1002,38 +1046,9 @@ class Kotor2SyncTab(QWidget):
         mod: dict,
         hash_cache: dict[Path, str] | None = None,
     ) -> str:
-        mod_name = self._kson_mod_name(mod)
-        archive_name = self._display_archive_name(mod)
-        expected_hash = str(mod.get("archive_xxh3") or "").strip().lower()
-        if not archive_name:
-            self._set_validation_row(row, "Empty OK", mod_name, archive_name, expected_hash, None, "", "Blank archive_name means this is a valid empty mod.")
-            return "empty"
-        if not expected_hash:
-            self._set_validation_row(row, "Skipped", mod_name, archive_name, expected_hash, None, "", "No archive hash in KSON.")
-            return "skipped"
-
-        archive_path = self._archive_path_for_mod(mod)
-        if archive_path is None:
-            self._set_validation_row(row, "Missing", mod_name, archive_name, expected_hash, None, "", "Archive not found in MO2 downloads.")
-            return "missing"
-
-        if hash_cache is not None:
-            if archive_path not in hash_cache:
-                hash_cache[archive_path] = file_hash(archive_path).lower()
-            actual_hash = hash_cache[archive_path]
-        else:
-            actual_hash = file_hash(archive_path).lower()
-        if actual_hash == expected_hash:
-            self._set_validation_row(row, "Hash OK", mod_name, archive_name, expected_hash, archive_path, actual_hash, "Archive hash matches.")
-            return "ok"
-
-        archive_files_ok, result_text = self._archive_contents_hash_ok(mod, archive_path)
-        if archive_files_ok:
-            self._set_validation_row(row, "Hash OK", mod_name, archive_name, expected_hash, archive_path, actual_hash, result_text)
-            return "ok"
-
-        self._set_validation_row(row, "Hash Miss", mod_name, archive_name, expected_hash, archive_path, actual_hash, result_text)
-        return "mismatch"
+        result = self._archive_service().validate_mod(mod, hash_cache=hash_cache)
+        self._apply_validation_result(row, result)
+        return str(result.get("bucket") or "skipped")
 
     # Validate local archive files against archive names and XXH3 hashes in the cached KSON.
     def _validate_archives(self):
@@ -1042,42 +1057,77 @@ class Kotor2SyncTab(QWidget):
             self._details.setPlainText("No cached KSON is loaded. Fetch or place a local KSON first.")
             logger.warning("[KOTOR2 Sync] Archive validation skipped: no cached KSON.")
             return
+        if self._validation_thread is not None:
+            return
 
-        self._prepare_tslrcm_archives_for_validation(kson)
+        rows = [self._tree.topLevelItem(index) for index in range(self._tree.topLevelItemCount())]
+        row_specs = [
+            {
+                "row_index": index,
+                "mod": row.data(0, Qt.ItemDataRole.UserRole + 1),
+                "mod_name": row.text(2),
+            }
+            for index, row in enumerate(rows)
+        ]
 
-        mods_by_name: dict[str, list[dict]] = {}
-        for mod in kson.get("mods", []):
-            if not isinstance(mod, dict):
-                continue
-            mod_name = self._kson_mod_name(mod)
-            if mod_name:
-                mods_by_name.setdefault(mod_name, []).append(mod)
-
-        hash_cache: dict[Path, str] = {}
-        counts = {"ok": 0, "empty": 0, "missing": 0, "mismatch": 0, "skipped": 0}
-        sorting_enabled = self._tree.isSortingEnabled()
+        self._validated_for_sync = False
+        self._update_sync_button_state()
+        self._validation_sorting_enabled = self._tree.isSortingEnabled()
         self._tree.setSortingEnabled(False)
-        try:
-            rows = [self._tree.topLevelItem(index) for index in range(self._tree.topLevelItemCount())]
-            for index, row in enumerate(rows):
-                mod = row.data(0, Qt.ItemDataRole.UserRole + 1)
-                if not isinstance(mod, dict):
-                    matches = mods_by_name.get(row.text(2), [])
-                    mod = matches.pop(0) if matches else None
-                if not isinstance(mod, dict):
-                    counts["skipped"] += 1
-                    self._set_validation_row(row, "Skipped", row.text(2), "", "", None, "", "No matching KSON mod entry was found for this row.")
-                    continue
+        for row in rows:
+            row.setText(0, "Queued")
 
-                mod_name = self._kson_mod_name(mod)
-                row.setText(0, "Checking")
-                self._summary_label.setText(f"Validating {index + 1}/{len(rows)}: {mod_name}")
-                QApplication.processEvents()
-                result = self._validate_archive_row_from_mod(mod=mod, row=row, hash_cache=hash_cache)
-                counts[result] += 1
-        finally:
-            self._tree.setSortingEnabled(sorting_enabled)
+        thread = QThread(self)
+        worker = _ValidationWorker(self._cache_path(), self._downloads_path(), kson, row_specs)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._update_validation_progress)
+        worker.finished.connect(self._finish_archive_validation)
+        worker.failed.connect(self._fail_archive_validation)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_validation_worker)
+        self._validation_thread = thread
+        self._validation_worker = worker
+        self._refresh_btn.setEnabled(False)
+        self._download_btn.setEnabled(False)
+        self._sync_btn.setEnabled(False)
+        self._summary_label.setText(f"Validating 0/{len(rows)}")
+        self._details.setPlainText("Validating downloaded archives...")
+        logger.info("[KOTOR2 Sync] Starting archive validation.")
+        thread.start()
 
+    def _prepare_tslrcm_archives_for_validation(self, kson: dict):
+        self._archive_service().prepare_tslrcm_archives_for_validation(kson)
+
+    def _archive_service(self) -> ArchiveService:
+        return ArchiveService(self._downloads_path(), self._cache_path())
+
+    def _apply_validation_result(self, row: QTreeWidgetItem, result: dict):
+        archive_path_text = str(result.get("archive_path") or "").strip()
+        archive_path = Path(archive_path_text) if archive_path_text else None
+        self._set_validation_row(
+            row,
+            str(result.get("state") or "Skipped"),
+            str(result.get("mod_name") or ""),
+            str(result.get("archive_name") or ""),
+            str(result.get("expected_hash") or ""),
+            archive_path,
+            str(result.get("actual_hash") or ""),
+            str(result.get("result") or ""),
+        )
+
+    def _update_validation_progress(self, current: int, total: int, row_index: int, result: dict):
+        row = self._tree.topLevelItem(row_index)
+        if row is None:
+            return
+        self._apply_validation_result(row, result)
+        self._summary_label.setText(f"Validating {current}/{total}: {result.get('mod_name') or row.text(2)}")
+
+    def _finish_archive_validation(self, counts: dict):
+        self._restore_validation_sorting()
         self._summary_label.setText(
             f"{counts['ok']} ok | {counts['empty']} empty | {counts['missing']} missing | "
             f"{counts['mismatch']} mismatch | {counts['skipped']} skipped"
@@ -1090,24 +1140,32 @@ class Kotor2SyncTab(QWidget):
         self._update_sync_button_state()
         self._update_details()
 
-    def _prepare_tslrcm_archives_for_validation(self, kson: dict):
-        mods = kson.get("mods", [])
-        if not isinstance(mods, list):
+    def _fail_archive_validation(self, message: str):
+        self._restore_validation_sorting()
+        self._validated_for_sync = False
+        self._summary_label.setText("Validation failed")
+        self._details.setPlainText(f"Archive validation failed:\n{message}")
+        logger.warning(f"[KOTOR2 Sync] Archive validation failed: {message}")
+        self._update_sync_button_state()
+
+    def _restore_validation_sorting(self):
+        if self._validation_sorting_enabled is None:
             return
-        for mod in mods:
-            if not isinstance(mod, dict):
-                continue
-            archive_name = str(mod.get("archive_name") or "").strip()
-            if not self._is_tslrcm_expected_archive_name(archive_name):
-                continue
-            try:
-                self._convert_matching_tslrcm_installer(archive_name)
-            except Exception as exc:
-                logger.warning(f"[KOTOR2 Sync] TSLRCM pre-validation conversion failed for {archive_name}: {exc}")
+        self._tree.setSortingEnabled(self._validation_sorting_enabled)
+        self._validation_sorting_enabled = None
+
+    def _clear_validation_worker(self):
+        self._restore_validation_sorting()
+        self._validation_thread = None
+        self._validation_worker = None
+        if self._fetch_thread is None:
+            self._refresh_btn.setEnabled(True)
+            self._download_btn.setEnabled(True)
+        self._update_sync_button_state()
 
     # Install the validated KSON into MO2 mods and update profile modlist.txt.
     def _sync_validated_build(self):
-        if not self._validated_for_sync or self._sync_thread is not None or self._sync_busy:
+        if not self._validated_for_sync or self._sync_thread is not None or self._sync_busy or self._validation_thread is not None:
             return
         kson_path = self._cache_path()
         if not kson_path.exists():
@@ -1135,7 +1193,6 @@ class Kotor2SyncTab(QWidget):
         logger.info(f"[KOTOR2 Sync] Starting sync from {kson_path}.")
         thread.start()
 
-    # Show sync worker progress.
     def _update_sync_progress(self, current: int, total: int, mod_name: str, status: str):
         self._summary_label.setText(f"Syncing {current}/{total}: {mod_name}")
         self._sync_progress_lines.append(f"[{current}/{total}] {mod_name}: {status}")
@@ -1143,7 +1200,6 @@ class Kotor2SyncTab(QWidget):
         self._details.setPlainText("\n".join(self._sync_progress_lines))
         self._details.verticalScrollBar().setValue(self._details.verticalScrollBar().maximum())
 
-    # Show sync completion details.
     def _finish_sync(self, result: SyncInstallResult):
         details = [f"Synced {result.mod_count} mod(s).", f"Updated: {Path(self._organizer.profilePath()) / 'modlist.txt'}"]
         if result.warnings:
@@ -1156,7 +1212,6 @@ class Kotor2SyncTab(QWidget):
         refresh_mo2(self._organizer, self)
         QTimer.singleShot(750, self._run_post_sync_steps)
 
-    # Show sync failure details.
     def _fail_sync(self, message: str):
         self._details.setPlainText(f"Sync failed:\n{message}")
         self._summary_label.setText("Sync failed")
@@ -1165,7 +1220,6 @@ class Kotor2SyncTab(QWidget):
         self._update_sync_button_state()
         refresh_mo2(self._organizer, self)
 
-    # Clear sync worker references.
     def _clear_sync_worker(self):
         self._sync_thread = None
         self._sync_worker = None
@@ -1199,7 +1253,13 @@ class Kotor2SyncTab(QWidget):
         self._refresh_related_tabs()
 
     def _update_sync_button_state(self):
-        self._sync_btn.setEnabled(self._validated_for_sync and not self._sync_busy and self._sync_thread is None)
+        self._sync_btn.setEnabled(
+            self._validated_for_sync
+            and not self._sync_busy
+            and self._sync_thread is None
+            and self._fetch_thread is None
+            and self._validation_thread is None
+        )
 
     # Refresh textures and run the auto-fix loop after patching.
     def _run_texture_auto_fix_after_sync(self):
@@ -1223,7 +1283,6 @@ class Kotor2SyncTab(QWidget):
             if callable(refresh):
                 refresh()
 
-    # Update one sync row after archive validation.
     def _set_validation_row(
         self,
         row: QTreeWidgetItem,
@@ -1306,24 +1365,7 @@ class Kotor2SyncTab(QWidget):
 
     # Resolve one or more archive names to a file in MO2 downloads.
     def _archive_path(self, *archive_names: str) -> Path | None:
-        downloads_path = self._downloads_path()
-        candidates: list[str] = []
-        for archive_name in archive_names:
-            candidates.extend([archive_name, html.unescape(archive_name)])
-        seen: set[str] = set()
-        for candidate in candidates:
-            cleaned = candidate.strip().strip('"').strip("'")
-            if not cleaned or cleaned in seen:
-                continue
-            seen.add(cleaned)
-            for path in (downloads_path / cleaned, downloads_path / f"{cleaned}.zip"):
-                if path.exists():
-                    return path
-        expected_archive_name = next((str(name).strip() for name in archive_names if str(name).strip()), "")
-        converted_path = self._convert_matching_tslrcm_installer(expected_archive_name)
-        if converted_path is not None and converted_path.exists():
-            return converted_path
-        return None
+        return self._archive_service().resolve_named_archive_path(*archive_names)
 
     @staticmethod
     def _normalize_release_date(value: str) -> str:
@@ -1407,96 +1449,6 @@ class Kotor2SyncTab(QWidget):
                 return download_url, f"DeadlyScraper selected the DeadlyStream version published on {expected_release_date}."
         return "", f"No DeadlyStream version matches KSON release date {expected_release_date} for {self._kson_mod_name(mod)}."
 
-    # Allow an archive with matching contents to pass even if the container hash differs.
-    def _archive_contents_hash_ok(self, mod: dict, archive_path: Path) -> tuple[bool, str]:
-        archive_files = mod.get("archive_files")
-        if not isinstance(archive_files, list) or not archive_files:
-            return False, "Archive hash does not match."
-
-        expected_by_path: dict[str, str] = {}
-        for file_entry in archive_files:
-            if not isinstance(file_entry, dict):
-                return False, "Archive hash does not match."
-            path = str(file_entry.get("path") or "").strip().replace("\\", "/")
-            xxh3 = str(file_entry.get("xxh3") or "").strip().lower()
-            if not path or not xxh3:
-                return False, "Archive hash does not match."
-            expected_by_path[path] = xxh3
-
-        actual_by_path, extraction_error = self._archive_member_hashes(archive_path)
-        if extraction_error:
-            return False, f"Archive hash does not match, and archive contents could not be extracted for comparison ({extraction_error})."
-
-        expected_paths = set(expected_by_path)
-        actual_paths = set(actual_by_path)
-        if expected_paths != actual_paths:
-            missing = sorted(expected_paths - actual_paths)
-            extra = sorted(actual_paths - expected_paths)
-            details: list[str] = []
-            if missing:
-                details.append(f"missing {len(missing)} file(s)")
-            if extra:
-                details.append(f"extra {len(extra)} file(s)")
-            suffix = f" ({', '.join(details)})" if details else ""
-            return False, f"Archive hash does not match, and archive contents differ from KSON{suffix}."
-
-        mismatches = sorted(path for path in expected_paths if expected_by_path[path] != actual_by_path[path])
-        if mismatches:
-            return False, f"Archive hash does not match, and {len(mismatches)} archived file hash(es) differ from KSON."
-
-        return True, "Archive hash mismatched, but all archived file hashes match the KSON contents."
-
-    # Extract an archive with 7-Zip and hash the extracted files by relative path.
-    def _archive_member_hashes(self, archive_path: Path) -> tuple[dict[str, str], str]:
-        seven_zip = self._seven_zip_exe()
-        if seven_zip:
-            try:
-                with tempfile.TemporaryDirectory(prefix="kotorganizer_archive_hash_") as temp_dir:
-                    extract_root = Path(temp_dir) / "extract"
-                    extract_root.mkdir(parents=True, exist_ok=True)
-                    result = subprocess.run(
-                        [seven_zip, "x", "-y", f"-o{extract_root}", str(archive_path)],
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        check=False,
-                        startupinfo=self._subprocess_startupinfo(),
-                        creationflags=self._subprocess_creationflags(),
-                    )
-                    if result.returncode != 0:
-                        detail = (result.stderr or result.stdout or "").strip()
-                        return {}, detail or f"7-Zip extraction failed with exit code {result.returncode}"
-                    return (
-                        {
-                            path.relative_to(extract_root).as_posix(): file_hash(path).lower()
-                            for path in sorted(extract_root.rglob("*"))
-                            if path.is_file()
-                        },
-                        "",
-                    )
-            except Exception as exc:
-                return {}, str(exc)
-
-        if archive_path.suffix.lower() != ".zip":
-            return {}, "7-Zip is unavailable for non-ZIP archive comparison"
-        try:
-            with zipfile.ZipFile(archive_path) as archive:
-                with tempfile.TemporaryDirectory(prefix="kotorganizer_archive_hash_") as temp_dir:
-                    extract_root = Path(temp_dir) / "extract"
-                    extract_root.mkdir(parents=True, exist_ok=True)
-                    archive.extractall(extract_root)
-                    return (
-                        {
-                            path.relative_to(extract_root).as_posix(): file_hash(path).lower()
-                            for path in sorted(extract_root.rglob("*"))
-                            if path.is_file()
-                        },
-                        "",
-                    )
-        except Exception as exc:
-            return {}, str(exc)
-
     # Wrap a loose download in an uncompressed ZIP.
     def _wrap_loose_download(self, archive_path: Path, archive_name: str) -> tuple[Path, str]:
         converted_path, converted_result = self._convert_tslrcm_installer_if_needed(archive_path, archive_name)
@@ -1541,171 +1493,52 @@ class Kotor2SyncTab(QWidget):
 
     # Convert a downloaded TSLRCM 2022 installer into the expected archive when possible.
     def _convert_tslrcm_installer_if_needed(self, archive_path: Path, archive_name: str) -> tuple[Path, str]:
-        if not self._should_convert_tslrcm_installer(archive_path, archive_name):
-            return archive_path, ""
-        target_path = archive_path.with_name(self._tslrcm_archive_output_name(archive_name))
-        if target_path.exists() and self._is_known_archive(target_path):
-            return target_path, f"Using converted TSLRCM archive: {target_path.name}"
-        try:
-            converted_path = self._convert_tslrcm_installer_to_archive(archive_path, target_path)
-            return converted_path, f"Converted TSLRCM installer to archive: {converted_path.name}"
-        except Exception as exc:
-            return archive_path, f"TSLRCM installer conversion failed: {exc}"
+        return self._archive_service().convert_tslrcm_installer_if_needed(archive_path, archive_name)
 
     # Try to convert a matching TSLRCM installer already present in downloads.
     def _convert_matching_tslrcm_installer(self, archive_name: str) -> Path | None:
-        expected_name = html.unescape(archive_name).strip()
-        if not expected_name:
-            return None
-        for candidate in self._downloads_path().iterdir():
-            if not candidate.is_file():
-                continue
-            if not self._is_tslrcm_installer_path(candidate):
-                continue
-            converted_path, _result = self._convert_tslrcm_installer_if_needed(candidate, archive_name)
-            if converted_path.exists() and converted_path.suffix.lower() == ".zip":
-                return converted_path
-        return None
+        return self._archive_service().convert_matching_tslrcm_installer(archive_name)
 
     # Check whether a path is the known TSLRCM 2022 installer.
     @staticmethod
     def _is_tslrcm_installer_path(path: Path) -> bool:
-        if not path.exists() or not path.is_file():
-            return False
-        if path.suffix.lower() != ".exe":
-            return False
-        stem = path.stem.casefold().strip()
-        normalized = "".join(ch for ch in stem if ch.isalnum())
-        return normalized.startswith("tslrcm2022")
+        return ArchiveService.is_tslrcm_installer_path(path)
 
     @classmethod
     def _should_convert_tslrcm_installer(cls, path: Path, archive_name: str) -> bool:
-        if cls._is_tslrcm_installer_path(path):
-            return True
-        if path.suffix.lower() != ".exe" or not path.exists() or not path.is_file():
-            return False
-        if not cls._is_tslrcm_expected_archive_name(archive_name):
-            return False
-        stem = path.stem.casefold().strip()
-        normalized = "".join(ch for ch in stem if ch.isalnum())
-        return normalized == "tslrcm"
+        return ArchiveService.should_convert_tslrcm_installer(path, archive_name)
 
     @staticmethod
     def _is_tslrcm_expected_archive_name(name: str) -> bool:
-        cleaned = html.unescape(str(name or "")).strip().casefold()
-        if not cleaned:
-            return False
-        stem = Path(cleaned).stem
-        normalized = "".join(ch for ch in stem if ch.isalnum())
-        return normalized.startswith("tslrcm2022")
+        return ArchiveService.is_tslrcm_expected_archive_name(name)
 
     @staticmethod
     def _tslrcm_archive_output_name(name: str) -> str:
-        cleaned = html.unescape(str(name or "")).strip()
-        if cleaned:
-            stem = Path(cleaned).stem
-            normalized = "".join(ch for ch in stem.casefold() if ch.isalnum())
-            if normalized.startswith("tslrcm2022"):
-                return f"{stem}.zip"
-            return cleaned if Path(cleaned).suffix.lower() == ".zip" else f"{cleaned}.zip"
-        return "tslrcm2022.zip"
-
-    # Convert the TSLRCM installer payload into a deterministic ZIP archive.
-    def _convert_tslrcm_installer_to_archive(self, installer_path: Path, archive_path: Path) -> Path:
-        script_path = Path(__file__).resolve().parent / "tslrcm-lzma.ps1"
-        if not script_path.exists():
-            raise RuntimeError(f"Missing converter script: {script_path}")
-        with tempfile.TemporaryDirectory(prefix="kotorganizer_tslrcm_") as temp_dir:
-            normalized_path = Path(temp_dir) / "normalized"
-            result = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    str(script_path),
-                    str(installer_path),
-                    str(normalized_path),
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                startupinfo=self._subprocess_startupinfo(),
-                creationflags=self._subprocess_creationflags(),
-            )
-            if result.returncode != 0:
-                raise RuntimeError((result.stderr or result.stdout or "converter failed").strip())
-            files = sorted(path for path in normalized_path.rglob("*") if path.is_file())
-            if not files:
-                raise RuntimeError("converter produced no normalized files")
-            archive_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_zip = archive_path.with_name(f"{archive_path.name}.tmp")
-            if temp_zip.exists():
-                temp_zip.unlink()
-            try:
-                with zipfile.ZipFile(temp_zip, "w", compression=zipfile.ZIP_STORED) as archive:
-                    for file_path in files:
-                        relative = file_path.relative_to(normalized_path).as_posix()
-                        info = zipfile.ZipInfo(relative)
-                        info.date_time = _FIXED_ZIP_TIMESTAMP
-                        info.compress_type = zipfile.ZIP_STORED
-                        info.create_system = 0
-                        archive.writestr(info, file_path.read_bytes())
-                temp_zip.replace(archive_path)
-            finally:
-                if temp_zip.exists():
-                    temp_zip.unlink(missing_ok=True)
-            return archive_path
+        return ArchiveService.tslrcm_archive_output_name(name)
 
     # Return the bundled 7-Zip executable.
     @staticmethod
     def _seven_zip_exe() -> str:
-        plugin_dir = Path(__file__).resolve().parent
-        exe = plugin_dir / "7z.exe"
-        dll = plugin_dir / "7z.dll"
-        return str(exe) if exe.exists() and dll.exists() else ""
+        return ArchiveService.seven_zip_exe()
 
     # Return Windows subprocess startup info when needed.
     @staticmethod
     def _subprocess_startupinfo():
-        if os.name != "nt":
-            return None
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        return startupinfo
+        return ArchiveService.subprocess_startupinfo()
 
     # Return Windows subprocess creation flags when needed.
     @staticmethod
     def _subprocess_creationflags() -> int:
-        return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        return ArchiveService.subprocess_creationflags()
 
     # Check whether a download is already an archive.
     @staticmethod
     def _is_archive_file(path: Path) -> bool:
-        return path.suffix.lower() in {
-            ".zip",
-            ".7z",
-            ".rar",
-            ".tar",
-            ".gz",
-            ".bz2",
-            ".xz",
-            ".tgz",
-            ".tbz2",
-            ".txz",
-        }
+        return ArchiveService.is_archive_file(path)
 
     # Check whether a path is a real archive, not just an archive-named file.
     def _is_known_archive(self, path: Path) -> bool:
-        if not path.exists() or not self._is_archive_file(path):
-            return False
-        suffix = path.suffix.lower()
-        if suffix == ".zip":
-            return zipfile.is_zipfile(path)
-        return True
+        return self._archive_service().is_known_archive(path)
 
     # Return MO2's downloads folder as a Path.
     def _downloads_path(self) -> Path:
@@ -1907,22 +1740,16 @@ class Kotor2SyncTab(QWidget):
             parser.write(handle)
 
     def _expected_archive_name(self, mod: dict) -> str:
-        return str(mod.get("archive_name") or "").strip()
-
-    def _local_archive_name(self, mod: dict) -> str:
-        return str(mod.get("local_archive_name") or "").strip()
+        return self._archive_service().expected_archive_name(mod)
 
     def _display_archive_name(self, mod: dict) -> str:
-        return self._local_archive_name(mod) or self._expected_archive_name(mod)
+        return self._archive_service().display_archive_name(mod)
 
-    def _archive_path_for_mod(self, mod: dict) -> Path | None:
-        return self._archive_path(self._local_archive_name(mod), self._expected_archive_name(mod))
+    def _archive_path_for_mod(self, mod: dict, hash_cache: dict[Path, str] | None = None) -> Path | None:
+        return self._archive_service().resolve_archive_path_for_mod(mod, hash_cache=hash_cache)
 
     def _capture_downloaded_archive_metadata(self, mod: dict, archive_path: Path):
         changed = False
-        if self._local_archive_name(mod) != archive_path.name:
-            mod["local_archive_name"] = archive_path.name
-            changed = True
         if not str(mod.get("archive_name") or "").strip():
             mod["archive_name"] = archive_path.name
             changed = True
@@ -1932,6 +1759,9 @@ class Kotor2SyncTab(QWidget):
                 changed = True
             except Exception:
                 pass
+        if "local_archive_name" in mod:
+            mod.pop("local_archive_name", None)
+            changed = True
         if changed:
             self._write_cached_kson_mod_update(mod)
 
@@ -1953,9 +1783,9 @@ class Kotor2SyncTab(QWidget):
                 continue
             if target_priority and str(item.get("priority") or "").strip() != target_priority:
                 continue
-            item["archive_name"] = str(mod.get("archive_name") or "").strip()
-            item["local_archive_name"] = str(mod.get("local_archive_name") or "").strip()
+            item["archive_name"] = self._expected_archive_name(mod)
             item["archive_xxh3"] = str(mod.get("archive_xxh3") or "").strip()
+            item.pop("local_archive_name", None)
             updated = True
             break
         if not updated:
@@ -2008,15 +1838,12 @@ class Kotor2SyncTab(QWidget):
         return ""
 
     # Return true if the KSON mod should be enabled in modlist.txt.
-    # Return whether a KSON mod is enabled.
     @staticmethod
     def _kson_mod_enabled(mod) -> bool:
         if not isinstance(mod, dict):
             return True
         return bool(mod.get("enabled", True))
 
-    # Build a short source label from a mod URL.
-    # Build a short source label.
     @staticmethod
     def _source_label(url: str) -> str:
         host = urlparse(url).netloc.lower()

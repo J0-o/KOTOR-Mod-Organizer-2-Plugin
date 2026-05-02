@@ -1,6 +1,5 @@
 import base64
 import configparser
-import html
 import json
 import os
 import shutil
@@ -11,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from archive_service import ArchiveService
 from patcher_entries import PatchEntry, collect_patch_entries
 
 
@@ -22,14 +22,12 @@ if os.name == "nt":
     SUBPROCESS_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW
 
 
-# Store sync install results.
 @dataclass
 class SyncInstallResult:
     mod_count: int
     warnings: list[str]
 
 
-# Install one KSON build into MO2.
 def install_kson_build(
     kson_path: Path,
     downloads_path: Path,
@@ -63,7 +61,6 @@ def install_kson_build(
     return SyncInstallResult(mod_count=total, warnings=warnings)
 
 
-# Delete saved patcher checkbox state before sync.
 def _delete_patch_order(profile_path: Path, warnings: list[str]) -> None:
     patch_order_path = profile_path / "tslpatch_order.json"
     if not patch_order_path.exists():
@@ -74,7 +71,6 @@ def _delete_patch_order(profile_path: Path, warnings: list[str]) -> None:
         warnings.append(f"failed to delete tslpatch_order.json: {exc}")
 
 
-# Write patcher checkbox state from the synced modlist.
 def _write_patch_order(
     profile_path: Path,
     mods_path: Path,
@@ -98,7 +94,6 @@ def _write_patch_order(
         warnings.append(f"failed to write tslpatch_order.json: {exc}")
 
 
-# Read enabled patch rows from KSON patch order.
 def _patch_order_enabled_state(patch_order: object) -> dict[tuple[str, str], bool]:
     rows = patch_order.get("patches", []) if isinstance(patch_order, dict) else patch_order
     if not isinstance(rows, list):
@@ -114,7 +109,6 @@ def _patch_order_enabled_state(patch_order: object) -> dict[tuple[str, str], boo
     return enabled_state
 
 
-# Convert common serialized booleans.
 def _truthy(value) -> bool:
     if isinstance(value, bool):
         return value
@@ -123,7 +117,6 @@ def _truthy(value) -> bool:
     return bool(value)
 
 
-# Write patch entries to the patcher JSON file.
 def _write_patch_order_entries(path: Path, entries: list[PatchEntry]) -> None:
     payload = {"patches": []}
     for entry in entries:
@@ -143,7 +136,6 @@ def _write_patch_order_entries(path: Path, entries: list[PatchEntry]) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-# Move existing mods aside except protected folders.
 def _move_existing_mods(mods_path: Path, warnings: list[str]) -> tuple[list[str], Path | None]:
     if not mods_path.exists():
         return [], None
@@ -165,7 +157,6 @@ def _move_existing_mods(mods_path: Path, warnings: list[str]) -> tuple[list[str]
     return preserved, old_mods_path if moved_any else None
 
 
-# Delete moved old mods when possible.
 def _cleanup_old_mods(old_mods_path: Path | None, warnings: list[str]) -> None:
     if old_mods_path is None or not old_mods_path.exists():
         return
@@ -178,7 +169,6 @@ def _cleanup_old_mods(old_mods_path: Path | None, warnings: list[str]) -> None:
         warnings.append(f"old mods cleanup failed for {old_mods_path}: {exc}")
 
 
-# Remove a folder tree with Windows read-only retry.
 def _remove_tree(path: Path) -> None:
     # Retry failed deletes after clearing read-only.
     def _retry_writeable(function, failed_path, exc_info):
@@ -191,7 +181,6 @@ def _remove_tree(path: Path) -> None:
     shutil.rmtree(path, onerror=_retry_writeable)
 
 
-# Build a unique mod folder path.
 def _unique_mod_path(mods_path: Path, name: str) -> Path:
     candidate = mods_path / name
     suffix = 2
@@ -201,12 +190,11 @@ def _unique_mod_path(mods_path: Path, name: str) -> Path:
     return candidate
 
 
-# Install one mod from the KSON.
 def _install_mod(mod: dict, downloads_path: Path, mods_path: Path, warnings: list[str], progress, index: int, total: int):
     mod_name = str(mod.get("mod_name") or "").strip()
-    archive_name = str(mod.get("archive_name") or "").strip()
-    local_archive_name = str(mod.get("local_archive_name") or "").strip()
-    selected_archive_name = local_archive_name or archive_name
+    archive_service = ArchiveService(downloads_path)
+    archive_name = archive_service.expected_archive_name(mod)
+    selected_archive_name = archive_name
     mod_path = mods_path / mod_name
     if mod_path.exists():
         old_mods_path = mods_path.parent / "_kotorganizer_sync_old_mods" / f"reinstall_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -222,7 +210,7 @@ def _install_mod(mod: dict, downloads_path: Path, mods_path: Path, warnings: lis
     if not selected_archive_name:
         return
 
-    archive_path = _archive_path(downloads_path, local_archive_name, archive_name)
+    archive_path = archive_service.resolve_archive_path_for_mod(mod)
     if archive_path is None:
         warnings.append(f"{mod_name}: archive not found: {selected_archive_name}")
         return
@@ -243,7 +231,6 @@ def _install_mod(mod: dict, downloads_path: Path, mods_path: Path, warnings: lis
         _mark_archive_meta_installed(mod, archive_path, mod_name)
 
 
-# Apply file actions for one mod.
 def _apply_actions(mod: dict, extract_path: Path, mod_path: Path, warnings: list[str]):
     mod_name = str(mod.get("mod_name") or "").strip()
     for action in mod.get("actions", []):
@@ -376,24 +363,6 @@ def _mark_archive_meta_installed(mod: dict, archive_path: Path, mod_name: str):
             parser.set("General", target, value)
     with meta_path.open("w", encoding="utf-8") as handle:
         parser.write(handle, space_around_delimiters=False)
-
-
-# Find an archive in downloads.
-def _archive_path(downloads_path: Path, *archive_names: str) -> Path | None:
-    candidates: list[str] = []
-    for archive_name in archive_names:
-        candidates.extend([archive_name, html.unescape(archive_name)])
-    seen: set[str] = set()
-    for candidate in candidates:
-        cleaned = candidate.strip().strip('"').strip("'")
-        if not cleaned or cleaned in seen:
-            continue
-        seen.add(cleaned)
-        for path in (downloads_path / cleaned, downloads_path / f"{cleaned}.zip"):
-            if path.exists():
-                return path
-    return None
-
 
 # Extract one archive.
 def _extract_archive(archive_path: Path, output_path: Path) -> bool:
